@@ -31,6 +31,7 @@ fn main() {
         "uninstall" => install::uninstall(&args[1..]),
         "info" => info(),
         "capture" => capture(&args[1..]),
+        "probe" => probe(&args[1..]),
         "zero" => zero(&args[1..]),
         "raw" => raw(&args[1..]),
         "dump" => dump(&args[1..]),
@@ -171,6 +172,57 @@ fn info() -> i32 {
         Err(e) => {
             eprintln!("не удалось прочитать блок: {e}");
             return 1;
+        }
+    }
+    0
+}
+
+/// Raw block diagnostics: where the zeros and the rails sit in the payload.
+///
+/// A code of 0 is the negative rail of the ADC, so a burst of zeros shows up as
+/// a fabricated full-scale spike. This prints their positions so the cause can
+/// be told apart from a genuine signal.
+fn probe(args: &[String]) -> i32 {
+    let blocks: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let mut dev = match open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let all: Vec<usize> = (0..CHANNELS).collect();
+    if let Err(e) = dev.set_channels(&all) {
+        eprintln!("{e}");
+        return 1;
+    }
+    for i in 0..blocks {
+        match dev.read_block() {
+            Ok(b) => {
+                println!("блок {i}: n={} на канал", b.n);
+                for ch in 0..CHANNELS {
+                    let Some(v) = &b.ch[ch] else { continue };
+                    let zeros = v.iter().filter(|&&x| x == 0).count();
+                    let top = v.iter().filter(|&&x| x >= 4090).count();
+                    let mn = v.iter().copied().min().unwrap_or(0);
+                    let mx = v.iter().copied().max().unwrap_or(0);
+                    let at: Vec<String> = v
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &x)| x == 0)
+                        .take(10)
+                        .map(|(j, _)| j.to_string())
+                        .collect();
+                    println!(
+                        "  CH{:<2} min={:<5} max={:<5} нулей={:<4} верх={:<4} позиции=[{}]",
+                        ch + 1, mn, mx, zeros, top, at.join(",")
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("блок {i}: {e}");
+                return 1;
+            }
         }
     }
     0

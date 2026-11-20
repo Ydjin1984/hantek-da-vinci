@@ -16,6 +16,12 @@ pub const ADC_MAX: u16 = 4095;
 /// Nominal mid-scale code, used until a real zero offset has been measured.
 pub const ZERO_NOMINAL: f32 = 2048.0;
 
+/// 16-bit samples the device returns in one acquisition, across all enabled
+/// channels. Measured on hardware: the buffer reports 8000 bytes (`0x1F40`), and
+/// that number does not change with the time base or channel count — only the
+/// per-channel split does (8 channels -> 500, 4 -> 1000, 1 -> 4000).
+pub const SAMPLES_PER_SCREEN: usize = 4000;
+
 /// Input range, selected per channel by command `0xA2`.
 ///
 /// The value sent to the device is `id` (1..=3). Voltage per ADC count is
@@ -128,6 +134,21 @@ impl TimeDiv {
 
     pub fn window_s(&self) -> f64 {
         self.ns_per_div as f64 * 10.0 / 1e9
+    }
+
+    /// Sample rate in hertz that this time base implies for `channels` channels.
+    ///
+    /// The device returns a fixed *byte* count per acquisition — 8000 bytes, i.e.
+    /// [`SAMPLES_PER_SCREEN`] 16-bit samples shared between the enabled channels.
+    /// The time span is fixed by the time base, so the per-channel rate depends on
+    /// how many channels are on: 8 channels at 500 µs/div is 500 samples over
+    /// 5 ms, one channel is 4000 samples over the same 5 ms.
+    pub fn sample_rate(&self, channels: usize) -> f64 {
+        if channels == 0 {
+            return 0.0;
+        }
+        let per_channel = (SAMPLES_PER_SCREEN / channels).max(1);
+        per_channel as f64 / self.window_s()
     }
 }
 
@@ -350,8 +371,19 @@ mod tests {
     }
 
     #[test]
-    fn time_div_follows_1_2_5() {
-        assert_eq!(TimeDiv::from_id(17).unwrap().ns_per_div, 500_000);
+    fn sample_rate_follows_the_time_base_not_the_link() {
+        // 500 µs/div is a 5 ms screen; 4000 samples are shared between channels,
+        // so eight channels give 500 each and one channel gives all 4000.
+        let td = TimeDiv::from_id(17).unwrap();
+        assert!((td.window_s() - 0.005).abs() < 1e-12);
+        assert!((td.sample_rate(8) - 100_000.0).abs() < 1e-6);
+        assert!((td.sample_rate(4) - 200_000.0).abs() < 1e-6);
+        assert!((td.sample_rate(1) - 800_000.0).abs() < 1e-6);
+        assert_eq!(td.sample_rate(0), 0.0);
+    }
+
+    #[test]
+    fn time_div_follows_1_2_5() {        assert_eq!(TimeDiv::from_id(17).unwrap().ns_per_div, 500_000);
         assert_eq!(TimeDiv::from_id(0).unwrap().ns_per_div, 1);
         assert_eq!(TimeDiv::from_id(3).unwrap().ns_per_div, 10);
         assert_eq!(TimeDiv::from_id(25).unwrap().ns_per_div, 200_000_000);

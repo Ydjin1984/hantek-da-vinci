@@ -66,6 +66,8 @@ fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Res
                 "block_samples": st.block_samples,
                 "blocks_per_s": st.blocks_per_s,
                 "time_div": st.time_div,
+                "time_div_id": st.time_div_id,
+                "window_s": st.window_s,
                 "error": st.error,
                 "log": {
                     "path": st.log_path,
@@ -105,6 +107,13 @@ fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Res
                         .map(|c| c - 1)
                         .collect();
                     eng.set_channels(list);
+                }
+                "time_div" => {
+                    if let Some(id) = get("id").and_then(|v| v.parse::<u8>().ok()) {
+                        if let Ok(td) = TimeDiv::from_id(id) {
+                            eng.set_time_div(td);
+                        }
+                    }
                 }
                 "range" => {
                     if let (Some(ch), Some(r)) = (get("ch"), get("r")) {

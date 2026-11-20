@@ -41,6 +41,8 @@ type Info = {
   block_samples: number;
   blocks_per_s: number;
   time_div: string;
+  time_div_id: number;
+  window_s: number;
   error: string | null;
   log: { path: string | null; bytes: number; seconds: number };
   blocks_total: number;
@@ -73,6 +75,8 @@ type Frame = {
   width: number;
   mask: number;
   dtNs: number;
+  /** samples per channel behind this frame */
+  n: number;
   chans: number[];
   /** per channel: Float32Array of [lo, hi] pairs in volts */
   data: Float32Array[];
@@ -148,6 +152,9 @@ async function fetchInfo() {
     state.info = await r.json();
     state.running = state.info!.running;
     state.logOn = !!state.info!.log.path;
+    // The x-axis is the acquisition window the hardware actually captured, not
+    // a zoom factor: one screen is one sweep.
+    if (state.info!.window_s > 0) state.span = state.info!.window_s;
     renderChips();
   } catch {
     /* daemon restarting */
@@ -177,18 +184,19 @@ async function fetchFrame() {
 
 function parseFrame(buf: ArrayBuffer): Frame | null {
   const dv = new DataView(buf);
-  // magic u32 | width u32 | mask u32 | dt_ns f32 | t0_ns u64 | nch u32 = 28 bytes
-  if (buf.byteLength < 28) return null;
+  // magic u32 | width u32 | mask u32 | dt_ns f32 | t0_ns u64 | nch u32 | n u32 = 32 bytes
+  if (buf.byteLength < 32) return null;
   const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
   if (magic !== "DVF1") return null;
   const width = dv.getUint32(4, true);
   const mask = dv.getUint32(8, true);
   const dtNs = dv.getFloat32(12, true);
   const nch = dv.getUint32(24, true);
+  const n = dv.getUint32(28, true);
   const chans: number[] = [];
   for (let c = 0; c < 8; c++) if (mask & (1 << c)) chans.push(c);
   const data: Float32Array[] = [];
-  let off = 28;
+  let off = 32;
   for (let i = 0; i < nch; i++) {
     const arr = new Float32Array(width * 2);
     for (let x = 0; x < width; x++) {
@@ -198,7 +206,7 @@ function parseFrame(buf: ArrayBuffer): Frame | null {
     }
     data.push(arr);
   }
-  return { width, mask, dtNs, chans, data };
+  return { width, mask, dtNs, n, chans, data };
 }
 
 // ------------------------------------------------------------------ rendering
@@ -422,9 +430,13 @@ function renderCards() {
 
 canvas.addEventListener("wheel", (e) => {
   e.preventDefault();
-  const k = e.deltaY > 0 ? 1.25 : 0.8;
-  state.span = Math.min(5, Math.max(0.002, state.span * k));
-  fetchFrame();
+  // Same as a scope's time/div knob: step the hardware time base. Zooming the
+  // drawing instead would stretch a single sweep and mislabel the axis.
+  const cur = state.info?.time_div_id ?? 17;
+  const next = Math.min(25, Math.max(0, cur + (e.deltaY > 0 ? 1 : -1)));
+  if (next === cur) return;
+  fetch(`/api/control?cmd=time_div&id=${next}`).catch(() => {});
+  fetchInfo().then(fetchFrame);
 }, { passive: false });
 
 canvas.addEventListener("mousemove", (e) => {

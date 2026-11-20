@@ -9,7 +9,7 @@
 //!   doubles as a cheap framing check.
 
 use crate::protocol::{
-    demux, Block, Range, TimeDiv, ADC_MAX, CHANNELS,
+    demux, Block, Range, TimeDiv, ADC_MAX, CHANNELS, MAX_PACKET,
 };
 use crate::transport::Transport;
 use crate::{Calibration, Error, Result};
@@ -272,84 +272,113 @@ impl Device {
         self.wait_ready()
     }
 
-    /// Poll `0xA5 0x5A` until the device reports a filled buffer.
+    /// Length in bytes that the device reports for one acquisition buffer.
     ///
-    /// Some firmware answers with echo plus a status byte (2 = buffer 2 is
-    /// ready, 3 = both), others echo only. Treat a bare echo as "not ready yet"
-    /// and keep asking; after the last attempt let the caller try reading.
-    fn wait_ready(&mut self) -> Result<()> {
-        for attempt in 0..20 {
-            self.io.write(&[0xA5, 0x5A])?;
-            let r = self.io.drain(64, 60)?;
-            if r.len() >= 2 && (r[1] == 2 || r[1] == 3) {
-                return Ok(());
-            }
-            if r.len() == 1 && r[0] == 0xA5 && attempt < 19 {
-                std::thread::sleep(Duration::from_millis(20));
-                self.ping()?;
-                continue;
-            }
-            if attempt == 19 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-            self.ping()?;
+    /// `C6 n` is answered with a big-endian 16-bit count. Zero means "this
+    /// buffer holds nothing right now", which is the normal state of the buffer
+    /// that the current acquisition is *not* filling.
+    fn buffer_len(&mut self, which: u8) -> Result<usize> {
+        let hdr = self.cmd_raw(&[0xC6, which], 2)?;
+        if hdr.len() < 2 {
+            return Ok(0);
         }
-        Ok(())
+        Ok(u16::from_be_bytes([hdr[0], hdr[1]]) as usize)
     }
 
-    /// Read one of the two acquisition buffers.
-    fn read_buffer(&mut self, which: u8) -> Result<Vec<u8>> {
-        let hdr = self.cmd_raw(&[0xC6, which], 2)?;
-        let len = u16::from_be_bytes([hdr[0], hdr[1]]) as usize;
-        if len == 0 || len > 64 * 1024 {
-            return Err(Error::Protocol(format!("implausible buffer length {len}")));
+    /// Acquisition buffer indices, in the order the firmware fills them.
+    const BUFFERS: [u8; 2] = [0x02, 0x03];
+
+    /// Wait until one of the acquisition buffers reports data, and let the sweep
+    /// finish filling it.
+    ///
+    /// `0xC0`/`0xC2` start the sweep. The buffer length becomes non-zero as soon
+    /// as the acquisition is under way — it announces how much is coming, not how
+    /// much has landed. Reading at that moment catches the device mid-write: the
+    /// sample under the write pointer reads back as zero, which is the negative
+    /// rail of the ADC and shows up as a fabricated full-scale spike. Waiting one
+    /// full sweep first puts the pointer past the end of the buffer.
+    fn wait_ready(&mut self) -> Result<()> {
+        let window = Duration::from_secs_f64(self.time_div.window_s());
+        let deadline = Instant::now() + Duration::from_millis(1500) + window * 3;
+        let mut spins = 0u32;
+        loop {
+            for which in Self::BUFFERS {
+                if self.buffer_len(which)? > 0 {
+                    let settle = fill_wait(window);
+                    if !settle.is_zero() {
+                        std::thread::sleep(settle);
+                    }
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Protocol(
+                    "timeout waiting for the device to fill an acquisition buffer".into(),
+                ));
+            }
+            // Keep the link alive: the device drops off USB after ~7 s of silence.
+            spins += 1;
+            if spins % 16 == 0 {
+                self.ping()?;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        let packets = len.div_ceil(64);
-        let mut out = Vec::with_capacity(len);
+    }
+
+    /// Read `len` bytes out of one acquisition buffer, `MAX_PACKET` at a time.
+    fn read_buffer(&mut self, which: u8, len: usize) -> Result<Vec<u8>> {
+        let packets = len.div_ceil(MAX_PACKET);
+        let mut out = Vec::with_capacity(packets * MAX_PACKET);
         for _ in 0..packets {
-            let p = self.cmd_raw(&[0xA6, which], 64)?;
+            let p = self.cmd_raw(&[0xA6, which], MAX_PACKET)?;
             out.extend_from_slice(&p);
         }
         out.truncate(len);
         Ok(out)
     }
 
-    /// One acquisition: arm, then drain both buffers.
+    /// One acquisition: arm, then drain every buffer that holds data.
     pub fn read_block(&mut self) -> Result<Block> {
         self.arm()?;
-        let mut bytes = self.read_buffer(0x02)?;
-        bytes.extend_from_slice(&self.read_buffer(0x03)?);
+        let mut bytes = Vec::new();
+        for which in Self::BUFFERS {
+            let len = self.buffer_len(which)?;
+            if len == 0 {
+                continue;
+            }
+            if len > 64 * 1024 {
+                return Err(Error::Protocol(format!("implausible buffer length {len}")));
+            }
+            bytes.extend_from_slice(&self.read_buffer(which, len)?);
+        }
+        if bytes.is_empty() {
+            return Err(Error::Protocol(
+                "device reported no acquisition data after arming".into(),
+            ));
+        }
         let t_ns = self.t0.elapsed().as_nanos() as u64;
         let block = demux(&bytes, &self.enabled, self.seq, t_ns)?;
         self.seq += 1;
         Ok(block)
     }
 
-    /// Measure the real sample rate and block cadence of the link.
+    /// Measure block cadence and the sample rate the time base implies.
     ///
-    /// The device does not report its clock, and the effective rate depends on
-    /// how many channels are enabled, so the only honest number is the measured
-    /// one. This is what the UI shows and the log records.
+    /// The device always hands back one screen of [`SAMPLES_PER_SCREEN`] samples
+    /// shared between the enabled channels, so the sample rate follows from the
+    /// time base and the channel count; what has to be measured is how many
+    /// blocks per second the USB link actually sustains.
     pub fn measure_rate(&mut self, samples: usize) -> Result<DeviceInfo> {
-        let mut total = 0usize;
         let mut blocks = 0usize;
         let mut block_n = 0usize;
         let start = Instant::now();
         for _ in 0..samples {
             let b = self.read_block()?;
-            total += b.n;
             block_n = b.n;
             blocks += 1;
         }
         let secs = start.elapsed().as_secs_f64().max(1e-9);
-        let rate = if blocks > 1 {
-            // First block pays for arming; measure the steady state.
-            (total.saturating_sub(block_n)) as f64 / (secs * (blocks - 1) as f64 / blocks as f64)
-        } else {
-            total as f64 / secs
-        };
-        self.info.sample_rate = rate;
+        self.info.sample_rate = self.time_div.sample_rate(self.enabled.len());
         self.info.block_samples = block_n;
         self.info.blocks_per_s = blocks as f64 / secs;
         Ok(self.info.clone())
@@ -404,4 +433,19 @@ impl Device {
     pub fn state(&self) -> DeviceInfo {
         self.info.clone()
     }
+}
+
+/// How long to let the sweep finish writing before the first packet is fetched.
+///
+/// Defaults to one full sweep plus a small margin. `DAVINCI_FILL_WAIT_MS`
+/// overrides it in milliseconds; that is what the zero-glitch experiment used to
+/// find the minimum value that keeps the write pointer out of the way.
+fn fill_wait(window: Duration) -> Duration {
+    if let Some(ms) = std::env::var("DAVINCI_FILL_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    (window + Duration::from_millis(4)).min(Duration::from_millis(4000))
 }

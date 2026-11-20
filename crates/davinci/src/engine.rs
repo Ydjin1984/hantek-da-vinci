@@ -59,6 +59,11 @@ pub struct Status {
     pub block_samples: usize,
     pub blocks_per_s: f64,
     pub time_div: String,
+    /// Protocol index of the time base, so the UI can step it.
+    pub time_div_id: u8,
+    /// Seconds one acquisition covers. This, not the USB throughput, is the
+    /// width of the screen and therefore the only honest x-axis label.
+    pub window_s: f64,
     pub error: Option<String>,
     pub log_path: Option<String>,
     pub log_bytes: u64,
@@ -110,7 +115,11 @@ impl Engine {
                 calib: dev.calib.clone(),
                 history: VecDeque::new(),
                 peaks: [Peak { min: f32::INFINITY, max: f32::NEG_INFINITY }; CHANNELS],
-                info_rate: fixed_rate(),
+                info_rate: if fixed_rate() > 0.0 {
+                    fixed_rate()
+                } else {
+                    dev.time_div.sample_rate(dev.enabled.len())
+                },
                 block_samples: 0,
                 blocks_per_s: 0.0,
                 link: dev.info.link.clone(),
@@ -187,6 +196,13 @@ impl Engine {
                 applied.time_div = want.time_div;
             }
 
+            // The time axis is defined by the time base and the number of
+            // channels, not by how fast USB happens to deliver blocks: the device
+            // always returns one screen of 4000 samples, split between the
+            // enabled channels. Deriving the rate from throughput instead made
+            // every frequency measurement drift with USB load.
+            self.inner.lock().unwrap().info_rate = implied_rate(&want);
+
             if !self.running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(20));
                 // Idle: keep the device alive without acquiring.
@@ -212,10 +228,8 @@ impl Engine {
                         if dt > 0.0 {
                             g.blocks_per_s = db as f64 / dt;
                             g.block_samples = n;
-                            if fixed_rate() == 0.0 {
-                                g.info_rate = g.blocks_per_s * n as f64;
-                            }
                         }
+                        // Throughput only; the sample rate comes from implied_rate.
                     }
                 }
                 Err(e) => {
@@ -257,8 +271,13 @@ impl EngineHandle {
         }
     }
 
-    pub fn set_range(&self, ch: usize, range: Range) {
+    /// Change the hardware time base, the way a scope's time/div knob does.
+    pub fn set_time_div(&self, td: TimeDiv) {
         let mut g = self.inner.lock().unwrap();
+        g.params.time_div = td;
+    }
+
+    pub fn set_range(&self, ch: usize, range: Range) {        let mut g = self.inner.lock().unwrap();
         if ch < CHANNELS {
             g.params.ranges[ch] = range;
         }
@@ -278,6 +297,8 @@ impl EngineHandle {
             block_samples: g.block_samples,
             blocks_per_s: g.blocks_per_s,
             time_div: g.params.time_div.label(),
+            time_div_id: g.params.time_div.id,
+            window_s: g.params.time_div.window_s(),
             error: g.error.clone(),
             log_path: g.log.as_ref().map(|l| l.path.display().to_string()),
             log_bytes: g.log.as_ref().map(|l| l.bytes).unwrap_or(0),
@@ -348,24 +369,22 @@ impl EngineHandle {
 
     /// Build the min/max envelope the UI draws.
     ///
-    /// One column per pixel, true extremes per column: a 3 ns glitch in a 200 ms
-    /// window survives, which is exactly what the vendor renderer throws away.
-    pub fn frame(&self, width: usize, span_s: f64) -> Frame {
+    /// One column per pixel, true extremes per column: a 3 ns glitch survives,
+    /// which is exactly what the vendor renderer throws away.
+    ///
+    /// Only the newest acquisition is drawn, never a run of them. Consecutive
+    /// blocks are separated by however long the USB round trip takes (tens of
+    /// milliseconds), so stitching them into one axis would invent a continuous
+    /// window that was never captured. One block *is* one screen.
+    pub fn frame(&self, width: usize, _span_s: f64) -> Frame {
         let g = self.inner.lock().unwrap();
         let width = width.clamp(16, 8192);
         let enabled: Vec<usize> = g.params.enabled.clone();
         let rate = if g.info_rate > 0.0 { g.info_rate } else { 1.0 };
-        let want = (span_s * rate) as usize;
-        let mut picked: Vec<Arc<Block>> = Vec::new();
-        let mut total = 0usize;
-        for b in g.history.iter().rev() {
-            picked.push(Arc::clone(b));
-            total += b.n;
-            if total >= want || picked.len() > 4096 {
-                break;
-            }
-        }
-        picked.reverse();
+        let picked: Vec<Arc<Block>> = match g.history.back() {
+            Some(b) => vec![Arc::clone(b)],
+            None => Vec::new(),
+        };
 
         let mut out: Vec<Vec<(f32, f32)>> = Vec::with_capacity(enabled.len());
         for &ch in &enabled {
@@ -404,6 +423,7 @@ impl EngineHandle {
             channels: enabled,
             dt_s: (1.0 / rate) as f32,
             t0_ns: picked.first().map(|b| b.t_ns).unwrap_or(0),
+            n: picked.first().map(|b| b.n).unwrap_or(0),
             columns: out,
         }
     }
@@ -450,19 +470,22 @@ impl EngineHandle {
     }
 }
 
-/// One decimated view of recent data.
+/// One decimated view of one acquisition.
 pub struct Frame {
     pub width: usize,
     pub channels: Vec<usize>,
     pub dt_s: f32,
     pub t0_ns: u64,
+    /// Samples per channel behind this frame, so the UI can label the real
+    /// width of the window instead of guessing.
+    pub n: usize,
     pub columns: Vec<Vec<(f32, f32)>>,
 }
 
 impl Frame {
     /// Binary wire format for the browser: volts in millivolts as i16.
     pub fn to_bytes(&self, zeroed: &[f32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24 + self.channels.len() * self.width * 4);
+        let mut out = Vec::with_capacity(32 + self.channels.len() * self.width * 4);
         out.extend_from_slice(b"DVF1");
         out.extend_from_slice(&(self.width as u32).to_le_bytes());
         let mut mask = 0u32;
@@ -473,6 +496,7 @@ impl Frame {
         out.extend_from_slice(&(self.dt_s * 1e9).to_le_bytes());
         out.extend_from_slice(&self.t0_ns.to_le_bytes());
         out.extend_from_slice(&(self.channels.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.n as u32).to_le_bytes());
         let _ = zeroed;
         for cols in &self.columns {
             for (lo, hi) in cols {
@@ -564,6 +588,18 @@ fn ingest(g: &mut Inner, block: Block, reset: &AtomicBool) {
         }
         g.history.pop_front();
     }
+}
+
+/// Sample rate implied by the time base and the number of enabled channels.
+///
+/// `DAVINCI_FIXED_RATE` still wins, so replay and simulation numbers stay
+/// comparable across machines.
+fn implied_rate(params: &Params) -> f64 {
+    let fixed = fixed_rate();
+    if fixed > 0.0 {
+        return fixed;
+    }
+    params.time_div.sample_rate(params.enabled.len())
 }
 
 /// Time base override for simulation and replay: when set, the engine trusts it
