@@ -22,6 +22,25 @@ pub const ZERO_NOMINAL: f32 = 2048.0;
 /// per-channel split does (8 channels -> 500, 4 -> 1000, 1 -> 4000).
 pub const SAMPLES_PER_SCREEN: usize = 4000;
 
+/// Slots the device multiplexes into one sample group.
+///
+/// Measured on hardware, one group per sample point is the channel count rounded
+/// up to an *even* number: 1 → 1, 2 → 2, 3 → 4, 4 → 4, 5 → 6, 6 → 6, 7 → 8,
+/// 8 → 8. The spare slots repeat the last enabled channel, so their data must be
+/// thrown away rather than handed out as another channel.
+///
+/// This is the difference between a readable trace and a comb: an odd channel
+/// count assumed to pack exactly `n` samples shifts every channel by one slot,
+/// so each channel receives a rotation of itself and its neighbours, and a
+/// square wave arrives as alternating values 2 V apart.
+pub fn mux_slots(channels: usize) -> usize {
+    if channels <= 1 {
+        1
+    } else {
+        channels + (channels & 1)
+    }
+}
+
 /// Real-time sampling rate of the whole instrument, in hertz.
 ///
 /// From the 1008C datasheet: 2.4 MSa/s, 4K memory, 100 kHz bandwidth. The
@@ -173,9 +192,10 @@ impl TimeDiv {
         if channels == 0 {
             return 0.0;
         }
-        let per_channel = (SAMPLES_PER_SCREEN / channels).max(1) as f64;
+        let slots = mux_slots(channels);
+        let per_channel = (SAMPLES_PER_SCREEN / slots).max(1) as f64;
         let demanded = per_channel / self.window_s();
-        let ceiling = ADC_TOTAL_HZ / channels as f64;
+        let ceiling = ADC_TOTAL_HZ / slots as f64;
         demanded.min(ceiling)
     }
 
@@ -188,7 +208,7 @@ impl TimeDiv {
         if rate <= 0.0 {
             return self.window_s();
         }
-        (SAMPLES_PER_SCREEN / channels.max(1)) as f64 / rate
+        (SAMPLES_PER_SCREEN / mux_slots(channels).max(1)) as f64 / rate
     }
 }
 
@@ -222,8 +242,16 @@ impl Block {
     /// Min/max envelope, `buckets` columns wide, for pixel-perfect rendering.
     ///
     /// Peaks are never dropped: each column reports the true extremes of the
+    /// Min/max envelope, `buckets` columns wide, for pixel-perfect rendering.
+    ///
+    /// Peaks are never dropped: each column reports the true extremes of the
     /// samples that fall into it, which is what makes a slow sweep look like the
     /// signal instead of a staircase.
+    ///
+    /// A column with no samples keeps `(INFINITY, NEG_INFINITY)` — `lo > hi` is
+    /// the "nothing here" marker. Filling it with 0 V instead invents a reading
+    /// the instrument never took, which is how a fast sweep with fewer samples
+    /// than pixels turns into a comb.
     pub fn envelope(&self, ch: usize, buckets: usize) -> Vec<(f32, f32)> {
         let mut out = vec![(f32::INFINITY, f32::NEG_INFINITY); buckets];
         let Some(raw) = &self.ch[ch] else { return out };
@@ -240,19 +268,15 @@ impl Block {
                 out[b].1 = v;
             }
         }
-        for cell in &mut out {
-            if !cell.0.is_finite() {
-                *cell = (0.0, 0.0);
-            }
-        }
         out
     }
 }
 
 /// Decode interleaved little-endian 16-bit samples into per-channel blocks.
 ///
-/// The device sends samples multiplexed across the enabled channels: sample `i`
-/// belongs to channel `enabled[i % n]`.
+/// The device sends sample groups of [`mux_slots`] words; the first
+/// `enabled.len()` slots of a group belong to the enabled channels in order and
+/// the rest repeat the last channel and are dropped here.
 pub fn demux(bytes: &[u8], enabled: &[usize], seq: u64, t_ns: u64) -> Result<Block> {
     if enabled.is_empty() {
         return Err(Error::Protocol("no enabled channels".into()));
@@ -264,13 +288,14 @@ pub fn demux(bytes: &[u8], enabled: &[usize], seq: u64, t_ns: u64) -> Result<Blo
         .chunks_exact(2)
         .map(|p| u16::from_le_bytes([p[0], p[1]]))
         .collect();
-    let n = shorts.len() / enabled.len();
+    let slots = mux_slots(enabled.len());
+    let n = shorts.len() / slots;
     let mut ch: [Option<Vec<u16>>; CHANNELS] = Default::default();
     for (slot, &c) in enabled.iter().enumerate() {
         if c >= CHANNELS {
             return Err(Error::Protocol(format!("channel {c} out of range")));
         }
-        let v: Vec<u16> = shorts.iter().skip(slot).step_by(enabled.len()).copied().collect();
+        let v: Vec<u16> = shorts.iter().take(n * slots).skip(slot).step_by(slots).copied().collect();
         ch[c] = Some(v);
     }
     Ok(Block { seq, t_ns, n, ch })
@@ -473,6 +498,62 @@ mod tests {
         assert_eq!(b.ch[0].as_ref().unwrap(), &[100, 101, 102, 103]);
         assert_eq!(b.ch[1].as_ref().unwrap(), &[900, 901, 902, 903]);
         assert!(b.ch[2].is_none());
+    }
+
+    #[test]
+    fn mux_slots_rounds_an_odd_count_up_to_even() {
+        assert_eq!(mux_slots(1), 1);
+        assert_eq!(mux_slots(2), 2);
+        assert_eq!(mux_slots(3), 4);
+        assert_eq!(mux_slots(4), 4);
+        assert_eq!(mux_slots(5), 6);
+        assert_eq!(mux_slots(6), 6);
+        assert_eq!(mux_slots(7), 8);
+        assert_eq!(mux_slots(8), 8);
+    }
+
+    #[test]
+    fn demux_drops_the_padding_slot_of_an_odd_channel_count() {
+        // Three channels travel in groups of four; the fourth slot repeats ch3.
+        // Reading it as a channel of its own is what used to rotate every
+        // channel into a comb.
+        let mut bytes = Vec::new();
+        for i in 0..3u16 {
+            bytes.extend_from_slice(&(100 + i).to_le_bytes()); // ch1
+            bytes.extend_from_slice(&(500 + i).to_le_bytes()); // ch2
+            bytes.extend_from_slice(&(900 + i).to_le_bytes()); // ch3
+            bytes.extend_from_slice(&(900 + i).to_le_bytes()); // padding
+        }
+        let b = demux(&bytes, &[0, 1, 2], 1, 0).unwrap();
+        assert_eq!(b.n, 3);
+        assert_eq!(b.ch[0].as_ref().unwrap(), &[100, 101, 102]);
+        assert_eq!(b.ch[1].as_ref().unwrap(), &[500, 501, 502]);
+        assert_eq!(b.ch[2].as_ref().unwrap(), &[900, 901, 902]);
+    }
+
+    #[test]
+    fn an_odd_channel_count_costs_a_slot_of_sample_rate() {
+        // 2.4 MSa/s shared over four slots (three channels plus padding) is
+        // 600 kSa/s per channel, not 800: the padding costs real throughput, and
+        // getting this wrong mislabels every frequency on the screen.
+        let td = TimeDiv::from_id(3).unwrap();
+        assert!((td.sample_rate(2) - 1_200_000.0).abs() < 1.0);
+        assert!((td.sample_rate(3) - 600_000.0).abs() < 1.0);
+        assert!((td.sample_rate(4) - 600_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn an_empty_column_is_not_a_reading() {
+        // Fewer samples than columns: the spare columns must say "nothing",
+        // not 0 V.
+        let mut b = Block::default();
+        b.n = 5;
+        b.ch[0] = Some(vec![2000, 2001, 2002, 2003, 2004]);
+        let env = b.envelope(0, 10);
+        assert_eq!(env.len(), 10);
+        let empty = env.iter().filter(|(lo, hi)| lo > hi).count();
+        assert!(empty > 0, "expected empty columns, got {env:?}");
+        assert!(env.iter().any(|(lo, hi)| lo <= hi));
     }
 
     #[test]

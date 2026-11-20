@@ -240,6 +240,9 @@ function frameRange(arr: Float32Array, n: number): { lo: number; hi: number } {
   for (let x = 0; x < n; x++) {
     const a = arr[x * 2];
     const b = arr[x * 2 + 1];
+    // Sentinel for "no sample in this column"; taking it as 32.8 V would make
+    // autoscale zoom out to nothing.
+    if (a > b) continue;
     if (a < lo) lo = a;
     if (a > hi) hi = a;
     if (b < lo) lo = b;
@@ -259,6 +262,12 @@ function updateAutoTargets() {
       continue;
     }
     const r = frameRange(f.data[idx], f.width);
+    if (!isFinite(r.lo) || !isFinite(r.hi)) {
+      // A frame can arrive before the first samples land; hold the old scale
+      // rather than collapsing to a span of zero.
+      autoTarget[lane] = null;
+      continue;
+    }
     autoTarget[lane] = {
       center: (r.lo + r.hi) / 2,
       span: Math.max(r.hi - r.lo, 1e-3) * 1.08,
@@ -431,33 +440,42 @@ function draw() {
       // which turned a pulse train into scattered dots; joining the columns makes
       // the waveform continuous while still showing the true min and max of every
       // column, so no peak is lost.
+      //
+      // A sweep with fewer samples than pixels leaves columns with no data at
+      // all; those arrive as lo > hi and are skipped. Drawing them as 0 V (which
+      // is what the daemon used to send) put a spike to zero between every real
+      // sample — the comb that appeared as soon as a third channel was switched
+      // on and halved the sample count.
       const step = plotW / n;
       const pxOf = (x: number) => GUTTER + x * step + step / 2;
       const clampY = (v: number) => Math.max(y0 + 1, Math.min(y0 + lh - 1, v));
+      const filled: number[] = [];
+      for (let x = 0; x < n; x++) if (arr[x * 2] <= arr[x * 2 + 1]) filled.push(x);
 
-      ctx.beginPath();
-      for (let x = 0; x < n; x++) {
-        const y = clampY(yOf(arr[x * 2 + 1]));
-        if (x === 0) ctx.moveTo(pxOf(x), y);
-        else ctx.lineTo(pxOf(x), y);
-      }
-      for (let x = n - 1; x >= 0; x--) {
-        ctx.lineTo(pxOf(x), clampY(yOf(arr[x * 2])));
-      }
-      ctx.closePath();
-      ctx.fillStyle = color + "3a";
-      ctx.fill();
+      if (filled.length > 0) {
+        ctx.beginPath();
+        ctx.moveTo(pxOf(filled[0]), clampY(yOf(arr[filled[0] * 2 + 1])));
+        for (let j = 1; j < filled.length; j++) {
+          ctx.lineTo(pxOf(filled[j]), clampY(yOf(arr[filled[j] * 2 + 1])));
+        }
+        for (let j = filled.length - 1; j >= 0; j--) {
+          ctx.lineTo(pxOf(filled[j]), clampY(yOf(arr[filled[j] * 2])));
+        }
+        ctx.closePath();
+        ctx.fillStyle = color + "3a";
+        ctx.fill();
 
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.3;
-      ctx.lineJoin = "round";
-      ctx.beginPath();
-      for (let x = 0; x < n; x++) {
-        const px = pxOf(x);
-        ctx.lineTo(px, clampY(yOf(arr[x * 2 + 1])));
-        ctx.lineTo(px, clampY(yOf(arr[x * 2])));
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.3;
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        for (const x of filled) {
+          const px = pxOf(x);
+          ctx.lineTo(px, clampY(yOf(arr[x * 2 + 1])));
+          ctx.lineTo(px, clampY(yOf(arr[x * 2])));
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
 
       // Gutter: name, range, per-division scale.
       ctx.fillStyle = color;
@@ -472,7 +490,8 @@ function draw() {
       ctx.fillText(ch.autoscale ? `${scale} авто` : scale, 12, y0 + 47);
 
       // Right: the number that matters — the value right now.
-      const now = arr[(n - 1) * 2 + 1];
+      const last = filled.length > 0 ? filled[filled.length - 1] : -1;
+      const now = last >= 0 ? arr[last * 2 + 1] : NaN;
       ctx.textAlign = "right";
       ctx.fillStyle = color;
       ctx.font = "700 15px ui-monospace, monospace";

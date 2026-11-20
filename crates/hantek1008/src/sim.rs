@@ -4,7 +4,7 @@
 //! hardware attached. The UI is developed and the tests run against this, so a
 //! missing scope never blocks work on the interesting parts.
 
-use crate::protocol::{ADC_MAX, CHANNELS};
+use crate::protocol::{mux_slots, ADC_MAX, CHANNELS};
 use crate::transport::Transport;
 use crate::Result;
 
@@ -55,11 +55,16 @@ impl SimTransport {
     }
 
     fn payload(&mut self, len: usize) -> Vec<u8> {
+        // Mirror the hardware's frame layout exactly: sample groups are the
+        // channel count rounded up to even, and the spare slots repeat the last
+        // channel. A simulator that packs them tightly cannot catch a demux
+        // that assumes it does.
+        let slots = mux_slots(self.enabled.len());
         let mut out = Vec::with_capacity(len + 2);
-        let chans = self.enabled.clone();
         while out.len() < len {
             let t = self.phase as f64 / self.rate;
-            for &ch in &chans {
+            for slot in 0..slots {
+                let ch = self.enabled[slot.min(self.enabled.len() - 1)];
                 let v = self.sample_at(ch, t);
                 out.extend_from_slice(&v.to_le_bytes());
                 if out.len() >= len {

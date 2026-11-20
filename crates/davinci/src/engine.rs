@@ -546,11 +546,10 @@ impl EngineHandle {
                     }
                 }
             }
-            for c in &mut cols {
-                if !c.0.is_finite() {
-                    *c = (0.0, 0.0);
-                }
-            }
+            // Columns with no sample keep `lo > hi`, the "nothing here" marker.
+            // They used to be filled with 0 V, which paints a reading the
+            // instrument never took: a sweep with fewer samples than pixels then
+            // turns every gap into a spike towards zero.
             out.push(cols);
         }
 
@@ -636,6 +635,9 @@ pub struct Frame {
 
 impl Frame {
     /// Binary wire format for the browser: volts in millivolts as i16.
+    ///
+    /// A column with no samples is written as `(32767, -32768)`, i.e. `lo > hi`;
+    /// the renderer skips it instead of drawing a fabricated 0 V.
     pub fn to_bytes(&self, zeroed: &[f32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(32 + self.channels.len() * self.width * 4);
         out.extend_from_slice(b"DVF1");
