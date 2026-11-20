@@ -426,26 +426,38 @@ function draw() {
         ctx.setLineDash([]);
       }
 
-      // The envelope: one vertical band per pixel column, min..max.
-      ctx.fillStyle = color + "cc";
+      // The envelope, drawn as one connected shape rather than a run of separate
+      // bars. Per-column bars left gaps wherever a column held a single sample,
+      // which turned a pulse train into scattered dots; joining the columns makes
+      // the waveform continuous while still showing the true min and max of every
+      // column, so no peak is lost.
       const step = plotW / n;
+      const pxOf = (x: number) => GUTTER + x * step + step / 2;
+      const clampY = (v: number) => Math.max(y0 + 1, Math.min(y0 + lh - 1, v));
+
+      ctx.beginPath();
       for (let x = 0; x < n; x++) {
-        const lo = arr[x * 2];
-        const hi = arr[x * 2 + 1];
-        const yl = yOf(hi);
-        const yh = yOf(lo);
-        const top = Math.max(y0 + 1, Math.min(yl, yh));
-        const bot = Math.min(y0 + lh - 1, Math.max(yl, yh));
-        const px = GUTTER + x * step;
-        const pw = Math.max(1, step);
-        if (bot - top < 1.5) {
-          ctx.fillRect(px, top, pw, 1.2);
-        } else {
-          ctx.globalAlpha = 0.55;
-          ctx.fillRect(px, top, pw, bot - top);
-          ctx.globalAlpha = 1;
-        }
+        const y = clampY(yOf(arr[x * 2 + 1]));
+        if (x === 0) ctx.moveTo(pxOf(x), y);
+        else ctx.lineTo(pxOf(x), y);
       }
+      for (let x = n - 1; x >= 0; x--) {
+        ctx.lineTo(pxOf(x), clampY(yOf(arr[x * 2])));
+      }
+      ctx.closePath();
+      ctx.fillStyle = color + "3a";
+      ctx.fill();
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.3;
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      for (let x = 0; x < n; x++) {
+        const px = pxOf(x);
+        ctx.lineTo(px, clampY(yOf(arr[x * 2 + 1])));
+        ctx.lineTo(px, clampY(yOf(arr[x * 2])));
+      }
+      ctx.stroke();
 
       // Gutter: name, range, per-division scale.
       ctx.fillStyle = color;

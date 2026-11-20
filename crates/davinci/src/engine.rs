@@ -330,6 +330,9 @@ impl EngineHandle {
         g.params.range_v[ch] = v;
         g.params.ranges[ch] = Range::covering(v);
         g.persist();
+        // Peak-hold from a wider range would claim volts this scale can never
+        // show, so switching scale starts the peaks over.
+        self.reset_peaks.store(true, Ordering::Relaxed);
     }
 
     /// Fit one channel, or all of them, to the full height of their lane.
