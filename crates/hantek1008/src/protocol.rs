@@ -47,6 +47,20 @@ pub enum Range {
 impl Range {
     pub const ALL: [Range; 3] = [Range::V04, Range::V25, Range::V20];
 
+    /// Smallest hardware range that can show ±`volts` without clipping.
+    ///
+    /// The instrument only has three ranges; anything finer than ±0.41 V is
+    /// digital zoom inside that range, and anything wider than ±20 V does not
+    /// exist at all.
+    pub fn covering(volts: f32) -> Range {
+        for r in Range::ALL {
+            if r.full_scale() >= volts - 1e-6 {
+                return r;
+            }
+        }
+        Range::V20
+    }
+
     /// Protocol id written to the device.
     pub fn id(self) -> u8 {
         self as u8
@@ -411,6 +425,19 @@ mod tests {
         let slow = TimeDiv::from_id(17).unwrap();
         assert!((slow.sample_rate(2) - 400_000.0).abs() < 1.0);
         assert!((slow.real_window_s(2) - slow.window_s()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_chosen_scale_picks_the_smallest_range_that_covers_it() {
+        // Finer than the instrument's narrowest range is digital zoom, so the
+        // hardware stays on ±0.41 V; wider steps up through ±2.5 V to ±20 V.
+        assert_eq!(Range::covering(0.1), Range::V04);
+        assert_eq!(Range::covering(0.2), Range::V04);
+        assert_eq!(Range::covering(0.4), Range::V04);
+        assert_eq!(Range::covering(0.5), Range::V25);
+        assert_eq!(Range::covering(2.5), Range::V25);
+        assert_eq!(Range::covering(3.0), Range::V20);
+        assert_eq!(Range::covering(20.0), Range::V20);
     }
 
     #[test]

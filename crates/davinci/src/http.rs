@@ -132,6 +132,13 @@ fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Res
                         .map(|c| c.saturating_sub(1));
                     eng.set_autoscale(ch, on);
                 }
+                "range_v" => {
+                    if let (Some(ch), Some(v)) = (get("ch"), get("v")) {
+                        if let (Ok(ch), Ok(v)) = (ch.parse::<usize>(), v.parse::<f32>()) {
+                            eng.set_range_v(ch.saturating_sub(1), v);
+                        }
+                    }
+                }
                 "range" => {
                     if let (Some(ch), Some(r)) = (get("ch"), get("r")) {
                         if let (Ok(ch), Ok(r)) = (ch.parse::<usize>(), r.parse::<usize>()) {

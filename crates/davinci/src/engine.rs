@@ -23,6 +23,12 @@ const HISTORY_SECONDS: f64 = 5.0;
 pub struct Params {
     pub enabled: Vec<usize>,
     pub ranges: [Range; CHANNELS],
+    /// Full scale the user asked to see, in volts, symmetric around zero.
+    ///
+    /// The instrument itself has only three ranges (±0.41, ±2.5, ±20 V), so this
+    /// is what the lane is scaled to, while `ranges` holds the hardware range
+    /// chosen to cover it. Below ±0.41 V the difference is digital zoom.
+    pub range_v: [f32; CHANNELS],
     pub time_div: TimeDiv,
     /// Fit each channel's trace to its whole lane. A display setting: the device
     /// never sees it, but it is part of the state that must survive a restart.
@@ -34,6 +40,7 @@ impl Default for Params {
         Params {
             enabled: (0..CHANNELS).collect(),
             ranges: [Range::V20; CHANNELS],
+            range_v: [20.0; CHANNELS],
             time_div: TimeDiv::DEFAULT,
             autoscale: [false; CHANNELS],
         }
@@ -121,6 +128,7 @@ impl Engine {
                 params: Params {
                     enabled: dev.enabled.clone(),
                     ranges: dev.ranges,
+                    range_v: dev.ranges.map(|r| r.full_scale()),
                     time_div: dev.time_div,
                     autoscale: [false; CHANNELS],
                 },
@@ -188,6 +196,7 @@ impl Engine {
         let mut applied = Params {
             enabled: dev.enabled.clone(),
             ranges: dev.ranges,
+            range_v: dev.ranges.map(|r| r.full_scale()),
             time_div: dev.time_div,
             autoscale: [false; CHANNELS],
         };
@@ -296,6 +305,7 @@ impl EngineHandle {
         let mut g = self.inner.lock().unwrap();
         if ch < CHANNELS {
             g.params.ranges[ch] = range;
+            g.params.range_v[ch] = range.full_scale();
         }
         g.persist();
     }
@@ -303,6 +313,22 @@ impl EngineHandle {
     pub fn set_range_all(&self, range: Range) {
         let mut g = self.inner.lock().unwrap();
         g.params.ranges = [range; CHANNELS];
+        g.params.range_v = [range.full_scale(); CHANNELS];
+        g.persist();
+    }
+
+    /// Choose the full scale a channel is drawn at, in volts.
+    ///
+    /// The hardware range is picked to cover it; anything finer than the ±0.41 V
+    /// range is digital zoom, which costs resolution but nothing else.
+    pub fn set_range_v(&self, ch: usize, volts: f32) {
+        let mut g = self.inner.lock().unwrap();
+        if ch >= CHANNELS {
+            return;
+        }
+        let v = volts.clamp(0.05, 20.0);
+        g.params.range_v[ch] = v;
+        g.params.ranges[ch] = Range::covering(v);
         g.persist();
     }
 
@@ -375,6 +401,13 @@ impl EngineHandle {
         for (i, slot) in g.params.autoscale.iter_mut().enumerate() {
             *slot = s.autoscale.get(i).copied().unwrap_or(false);
         }
+        for i in 0..CHANNELS {
+            if let Some(v) = s.range_v.get(i) {
+                let v = v.clamp(0.05, 20.0);
+                g.params.range_v[i] = v;
+                g.params.ranges[i] = Range::covering(v);
+            }
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -445,6 +478,7 @@ impl EngineHandle {
                     "autoscale": g.params.autoscale[ch],
                     "range_id": range.id(),
                     "range": range.label(),
+                    "range_v": g.params.range_v[ch],
                     "resolution": range.resolution(),
                     "min": m.map(|m| m.vmin),
                     "max": m.map(|m| m.vmax),
@@ -577,6 +611,7 @@ impl Inner {
         crate::settings::Settings {
             enabled: self.params.enabled.clone(),
             ranges: self.params.ranges.iter().map(|r| r.id()).collect(),
+            range_v: self.params.range_v.to_vec(),
             time_div_id: self.params.time_div.id,
             autoscale: self.params.autoscale.to_vec(),
         }

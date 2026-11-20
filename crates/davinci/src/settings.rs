@@ -21,6 +21,10 @@ pub struct Settings {
     /// Предел каждого канала, id 1..3.
     #[serde(default)]
     pub ranges: Vec<u8>,
+    /// Полная шкала, выбранная пользователем, в вольтах (±). Тоньше ±0,41 В —
+    /// цифровое сужение внутри младшего предела прибора.
+    #[serde(default)]
+    pub range_v: Vec<f32>,
     /// Развёртка, индекс 0..25.
     #[serde(default = "default_time_div_id")]
     pub time_div_id: u8,
@@ -38,6 +42,7 @@ impl Default for Settings {
         Settings {
             enabled: (0..CHANNELS).collect(),
             ranges: vec![DEFAULT_RANGE_ID; CHANNELS],
+            range_v: vec![20.0; CHANNELS],
             time_div_id: DEFAULT_TIME_DIV_ID,
             autoscale: vec![false; CHANNELS],
         }
@@ -93,14 +98,33 @@ impl Settings {
         }
 
         self.autoscale.resize(CHANNELS, false);
+
+        // Версия без `range_v` приходит со старым файлом: тогда шкала берётся
+        // из сохранённого id предела.
+        if self.range_v.len() < CHANNELS {
+            let mut v = vec![0.0f32; CHANNELS];
+            for (i, slot) in v.iter_mut().enumerate() {
+                let id = self.ranges.get(i).copied().unwrap_or(DEFAULT_RANGE_ID);
+                *slot = Range::from_id(id).unwrap_or(Range::V20).full_scale();
+            }
+            self.range_v = v;
+        }
+        for v in &mut self.range_v {
+            *v = v.clamp(0.05, 20.0);
+        }
     }
 
-    /// Пределы в виде, который ждёт прибор.
+    /// Пределы в виде, который ждёт прибор: самый узкий, но покрывающий выбор.
     pub fn range_array(&self) -> [Range; CHANNELS] {
         let mut out = [Range::V20; CHANNELS];
         for (i, slot) in out.iter_mut().enumerate() {
-            let id = self.ranges.get(i).copied().unwrap_or(DEFAULT_RANGE_ID);
-            *slot = Range::from_id(id).unwrap_or(Range::V20);
+            match self.range_v.get(i) {
+                Some(v) => *slot = Range::covering(*v),
+                None => {
+                    let id = self.ranges.get(i).copied().unwrap_or(DEFAULT_RANGE_ID);
+                    *slot = Range::from_id(id).unwrap_or(Range::V20);
+                }
+            }
         }
         out
     }

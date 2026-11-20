@@ -233,15 +233,26 @@ main {
   padding: 0;
 }
 
-.range {
-  font-size: 9.5px;
+select.range {
+  width: 100%;
+  margin-bottom: 6px;
+  font-size: 10px;
   color: var(--muted);
   font-family: var(--mono);
   border: 1px solid var(--line);
   border-radius: 5px;
-  padding: 2px 5px;
+  background: var(--panel);
+  padding: 2px 4px;
   cursor: pointer;
-  white-space: nowrap;
+  appearance: none;
+  text-align: center;
+}
+
+select.range:hover,
+select.range:focus {
+  border-color: var(--c);
+  color: var(--c);
+  outline: none;
 }
 
 .big {

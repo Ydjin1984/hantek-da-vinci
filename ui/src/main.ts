@@ -23,6 +23,8 @@ type ChannelInfo = {
   autoscale: boolean;
   range_id: number;
   range: string;
+  /** полная шкала, выбранная пользователем, в вольтах (±) */
+  range_v: number;
   resolution: number;
   min: number | null;
   max: number | null;
@@ -64,6 +66,20 @@ const COLORS = [
 ];
 
 const RANGE_LABELS = ["±0,4 В", "±2,5 В", "±20 В"];
+
+/**
+ * Full scales offered in the card list, in volts.
+ *
+ * The instrument physically has three ranges (±0.41, ±2.5, ±20 V); the rest is
+ * digital zoom inside the nearest one, which is still worth having because it
+ * decides how much of the lane a small signal fills.
+ */
+const RANGE_CHOICES: number[] = [0.1, 0.2, 0.5, 0.7, 1, ...Array.from({ length: 19 }, (_, i) => i + 2)];
+
+/** `0,1` / `1` / `20` — один знак после запятой только когда он нужен. */
+function fmtRangeV(v: number): string {
+  return Number.isInteger(v) ? String(v) : v.toFixed(1).replace(".", ",");
+}
 
 /** Smoothed autoscale mapping per lane; null when the lane keeps its fixed range. */
 const autoScale: ({ center: number; span: number } | null)[] = [null, null, null, null, null, null, null, null];
@@ -309,11 +325,6 @@ function laneHeight(): number {
   return (canvas.clientHeight - RULER) / Math.max(1, enabledLanes().length);
 }
 
-function vppOf(resolution: number): number {
-  // 4096 кодов АЦП на полную шкалу
-  return 4096 * resolution;
-}
-
 function draw() {
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -356,7 +367,8 @@ function draw() {
     // moving trace does not breathe.
     const mid = y0 + lh / 2;
     let center = 0; // volts at the middle of the lane
-    let vppVisible = vppOf(ch.resolution);
+    // Без авто-масштаба дорожка показывает ±выбранный предел целиком.
+    let vppVisible = Math.max(0.02, (ch.range_v ?? 20) * 2);
     const target = ch.autoscale ? autoTarget[lane] : null;
     if (target) {
       const prev = autoScale[lane];
@@ -442,7 +454,7 @@ function draw() {
       ctx.fillText(`CH${lane + 1}`, 12, y0 + 20);
       ctx.fillStyle = "#7d8da3";
       ctx.font = "500 10px ui-monospace, monospace";
-      ctx.fillText(RANGE_LABELS[ch.range_id - 1] ?? ch.range, 12, y0 + 34);
+      ctx.fillText(`±${fmtRangeV(ch.range_v ?? 20)} В`, 12, y0 + 34);
       const perDiv = vppVisible / 8;
       const scale = fmtPerDiv(perDiv);
       ctx.fillText(ch.autoscale ? `${scale} авто` : scale, 12, y0 + 47);
@@ -527,13 +539,18 @@ function renderCards() {
       <article class="card ${off ? "off" : ""}" data-ch="${c.ch}" style="--c:${color}">
         <div class="card-top">
           <button class="dot" title="включить/выключить" data-act="toggle">${c.ch}</button>
-          <span class="range" data-act="range" title="клик — сменить диапазон">${c.range}</span>
         </div>
         <div class="big">${fmtV(c.max)}</div>
         <label class="auto" title="растянуть дорожку на всю высоту">
           <input type="checkbox" data-act="auto"${c.autoscale ? " checked" : ""}>
           <span>авто</span>
         </label>
+        <select class="range" data-act="range" title="предел канала">
+          ${RANGE_CHOICES.map(
+            (v) =>
+              `<option value="${v}"${Math.abs(v - (c.range_v ?? 20)) < 1e-6 ? " selected" : ""}>±${fmtRangeV(v)} В</option>`,
+          ).join("")}
+        </select>
         <div class="row"><span>Vmin</span><b>${fmtV(c.min)}</b></div>
         <div class="row"><span>Vmax</span><b>${fmtV(c.max)}</b></div>
         <div class="row"><span>Vpp</span><b>${fmtV(c.pp)}</b></div>
@@ -580,27 +597,41 @@ canvas.addEventListener("click", (e) => {
 });
 
 cards.addEventListener("click", (e) => {
-  const el = (e.target as HTMLElement).closest("[data-act]") as HTMLElement | null;
-  const card = (e.target as HTMLElement).closest(".card") as HTMLElement | null;
+  const t = e.target as HTMLElement;
+  // The range <select> fires its own change; a click on it must not also cycle.
+  if (t.closest("select")) return;
+  const el = t.closest("[data-act]") as HTMLElement | null;
+  const card = t.closest(".card") as HTMLElement | null;
   if (!el || !card) return;
   const ch = Number(card.dataset.ch);
   if (el.dataset.act === "toggle") toggleChannel(ch);
-  if (el.dataset.act === "range") cycleRange(ch);
 });
 
 cards.addEventListener("change", (e) => {
-  const el = e.target as HTMLInputElement;
-  if (el.dataset.act !== "auto") return;
+  const el = e.target as HTMLInputElement | HTMLSelectElement;
   const card = el.closest(".card") as HTMLElement | null;
   if (!card) return;
   const ch = Number(card.dataset.ch);
-  const on = el.checked;
-  fetch(`/api/control?cmd=autoscale&ch=${ch}&on=${on ? 1 : 0}`).catch(() => {});
-  const c = state.channels.find((x) => x.ch === ch);
-  if (c) c.autoscale = on;
-  // Drop the smoothed mapping so the lane snaps to its new scale instead of
-  // sliding there over a second.
-  autoScale[ch - 1] = null;
+
+  if (el.dataset.act === "range") {
+    const v = Number((el as HTMLSelectElement).value);
+    fetch(`/api/control?cmd=range_v&ch=${ch}&v=${v}`).catch(() => {});
+    const c = state.channels.find((x) => x.ch === ch);
+    if (c) c.range_v = v;
+    // Let the lane snap to the new scale instead of sliding into it.
+    autoScale[ch - 1] = null;
+    autoTarget[ch - 1] = null;
+    return;
+  }
+
+  if (el.dataset.act === "auto") {
+    const input = el as HTMLInputElement;
+    const on = input.checked;
+    fetch(`/api/control?cmd=autoscale&ch=${ch}&on=${on ? 1 : 0}`).catch(() => {});
+    const c = state.channels.find((x) => x.ch === ch);
+    if (c) c.autoscale = on;
+    autoScale[ch - 1] = null;
+  }
 });
 
 function toggleChannel(ch: number) {
