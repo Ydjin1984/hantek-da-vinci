@@ -542,37 +542,92 @@ function renderChips() {
   chips.innerHTML = parts.join("");
 }
 
-function renderCards() {
-  cards.innerHTML = state.channels
-    .map((c) => {
-      const color = COLORS[c.ch - 1];
-      const off = !c.enabled;
-      return `
+/**
+ * Card shell, built once per channel.
+ *
+ * Everything that changes while a sweep runs lives in an element carrying
+ * `data-role`, so the poller can rewrite those values in place. Replacing the
+ * markup instead (which is what this used to do, every 400 ms) destroys an open
+ * `<select>` popup: the browser closes the list the moment its host element is
+ * gone, so picking a voltage limit only worked if you beat the timer.
+ */
+function cardHtml(c: ChannelInfo): string {
+  const color = COLORS[c.ch - 1];
+  const off = !c.enabled;
+  const rows: Array<[string, string, string]> = [
+    ["Vmin", "min", fmtV(c.min)],
+    ["Vmax", "max", fmtV(c.max)],
+    ["Vpp", "pp", fmtV(c.pp)],
+    ["RMS", "rms", fmtV(c.rms)],
+    ["Частота", "freq", fmtFreq(c.freq)],
+    ["Скважн.", "duty", c.duty !== null ? (c.duty * 100).toFixed(0) + " %" : "—"],
+  ];
+  return `
       <article class="card ${off ? "off" : ""}" data-ch="${c.ch}" style="--c:${color}">
         <div class="card-top">
           <button class="dot" title="включить/выключить" data-act="toggle">${c.ch}</button>
         </div>
-        <div class="big">${fmtV(c.max)}</div>
+        <div class="big" data-role="big">${fmtV(c.max)}</div>
         <label class="auto" title="растянуть дорожку на всю высоту">
           <input type="checkbox" data-act="auto"${c.autoscale ? " checked" : ""}>
           <span>авто</span>
         </label>
         <select class="range" data-act="range" title="предел канала">
           ${RANGE_CHOICES.map(
-            (v) =>
-              `<option value="${v}"${Math.abs(v - (c.range_v ?? 20)) < 1e-6 ? " selected" : ""}>±${fmtRangeV(v)} В</option>`,
+            (v) => `<option value="${v}"${Math.abs(v - (c.range_v ?? 20)) < 1e-6 ? " selected" : ""}>±${fmtRangeV(v)} В</option>`,
           ).join("")}
         </select>
-        <div class="row"><span>Vmin</span><b>${fmtV(c.min)}</b></div>
-        <div class="row"><span>Vmax</span><b>${fmtV(c.max)}</b></div>
-        <div class="row"><span>Vpp</span><b>${fmtV(c.pp)}</b></div>
-        <div class="row"><span>RMS</span><b>${fmtV(c.rms)}</b></div>
-        <div class="row"><span>Частота</span><b>${fmtFreq(c.freq)}</b></div>
-        <div class="row"><span>Скважн.</span><b>${c.duty !== null ? (c.duty * 100).toFixed(0) + " %" : "—"}</b></div>
-        <div class="row peak"><span>Пик-холд</span><b>${fmtV(c.peak_max)}</b></div>
+        ${rows.map(([label, role, val]) => `<div class="row"><span>${label}</span><b data-role="${role}">${val}</b></div>`).join("")}
+        <div class="row peak"><span>Пик-холд</span><b data-role="peak">${fmtV(c.peak_max)}</b></div>
       </article>`;
-    })
-    .join("");
+}
+
+function setText(root: HTMLElement, role: string, text: string) {
+  const el = root.querySelector<HTMLElement>(`[data-role="${role}"]`);
+  if (el && el.textContent !== text) el.textContent = text;
+}
+
+/** Push a channel's numbers into an existing card without touching its DOM shape. */
+function updateCard(el: HTMLElement, c: ChannelInfo) {
+  el.classList.toggle("off", !c.enabled);
+  el.style.setProperty("--c", COLORS[c.ch - 1]);
+  setText(el, "big", fmtV(c.max));
+  setText(el, "min", fmtV(c.min));
+  setText(el, "max", fmtV(c.max));
+  setText(el, "pp", fmtV(c.pp));
+  setText(el, "rms", fmtV(c.rms));
+  setText(el, "freq", fmtFreq(c.freq));
+  setText(el, "duty", c.duty !== null ? (c.duty * 100).toFixed(0) + " %" : "—");
+  setText(el, "peak", fmtV(c.peak_max));
+
+  // A control the user is operating is never written back: the checkbox would
+  // flicker and the select would snap to a stale value mid-choice.
+  const box = el.querySelector<HTMLInputElement>('input[data-act="auto"]');
+  if (box && box !== document.activeElement) box.checked = !!c.autoscale;
+
+  const sel = el.querySelector<HTMLSelectElement>("select.range");
+  if (sel && sel !== document.activeElement) {
+    const want = c.range_v ?? 20;
+    const cur = sel.selectedOptions[0];
+    const curV = cur ? Number(cur.value) : NaN;
+    if (!(Math.abs(curV - want) < 1e-6)) {
+      const hit = Array.from(sel.options).find((o) => Math.abs(Number(o.value) - want) < 1e-6);
+      if (hit) sel.value = hit.value;
+    }
+  }
+}
+
+function renderCards() {
+  // Only the set of channels decides the DOM shape; values are patched in place.
+  const shape = state.channels.map((c) => c.ch).join(",");
+  if (cards.dataset.shape !== shape) {
+    cards.dataset.shape = shape;
+    cards.innerHTML = state.channels.map(cardHtml).join("");
+  }
+  for (const el of cards.querySelectorAll<HTMLElement>(".card")) {
+    const c = state.channels.find((x) => String(x.ch) === el.dataset.ch);
+    if (c) updateCard(el, c);
+  }
 }
 
 // ------------------------------------------------------------------ controls
