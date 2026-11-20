@@ -83,14 +83,21 @@ fn usage() {
 }
 
 pub(crate) fn open() -> Result<Device, String> {
+    let dev = open_silent()?;
+    println!("прибор: {}", dev.info.link);
+    Ok(dev)
+}
+
+/// Same, without the identity line — for reports that print their own layout.
+pub(crate) fn open_silent() -> Result<Device, String> {
     let mut dev = Device::open().map_err(|e| {
         format!(
             "не удалось открыть прибор: {e}\n\
-             Прибор должен быть привязан к WinUSB (Zadig → Hantek 1008C → WinUSB).\n\
-             Вендорский драйвер Hantek для нашей программы не подходит."
+             Драйвер прибора должен быть WinUSB — установщик ставит его сам.\n\
+             Если драйвер уже стоит, прибор мог занять другой экземпляр программы.\n\
+             Проверка и починка: davinci doctor --fix"
         )
     })?;
-    println!("прибор: {}", dev.info.link);
     dev.init().map_err(|e| format!("инициализация не прошла: {e}"))?;
     Ok(dev)
 }

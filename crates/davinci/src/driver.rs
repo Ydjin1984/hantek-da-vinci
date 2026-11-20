@@ -271,9 +271,65 @@ pub fn status() -> Status {
     out
 }
 
-/// The strongest possible readiness signal: WinUSB hands us an interface path.
+/// The strongest possible readiness signal: the node is on WinUSB *and* it hands
+/// us an interface path.
+///
+/// Both halves are needed. A device that was just re-enumerated can still leave a
+/// stale interface entry behind, and a node owned by `DSO6CDE` can be listed while
+/// `WinUsb_Initialize` fails — either one would report "ready" for a device we
+/// cannot open.
 pub fn winusb_ready() -> bool {
-    !hantek1008::transport::winusb::device_paths().is_empty()
+    let st = status();
+    let on_winusb = st
+        .service
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case(WANT_SERVICE))
+        .unwrap_or(false);
+    on_winusb && !hantek1008::transport::winusb::device_paths().is_empty()
+}
+
+#[link(name = "newdev")]
+extern "system" {
+    /// `devcon update` in one call: binds the INF to every matching device and
+    /// ignores driver ranking. Ranking is the reason the plain PnP path is not
+    /// enough here — Hantek's 2017 package carries a newer `DriverVer` than the
+    /// WinUSB one, so an ordinary install picks the driver that bugchecks.
+    fn UpdateDriverForPlugAndPlayDevicesW(
+        hwnd: Handle,
+        hardware_id: *const u16,
+        inf_path: *const u16,
+        flags: u32,
+        reboot: *mut i32,
+    ) -> i32;
+}
+
+/// `INSTALLFLAG_FORCE`
+const INSTALLFLAG_FORCE: u32 = 0x0000_0001;
+
+/// Bind the package to the instrument, overriding driver ranking.
+fn force_bind(inf: &std::path::Path) -> Result<(), String> {
+    let hardware_id = wide(&format!("USB\\{VID_PID}"));
+    let inf_path = wide(&inf.to_string_lossy());
+    let mut reboot = 0i32;
+    let ok = unsafe {
+        UpdateDriverForPlugAndPlayDevicesW(
+            ptr::null_mut(),
+            hardware_id.as_ptr(),
+            inf_path.as_ptr(),
+            INSTALLFLAG_FORCE,
+            &mut reboot,
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(format!(
+            "не удалось привязать пакет к прибору (UpdateDriverForPlugAndPlayDevices, код {err})"
+        ));
+    }
+    if reboot != 0 {
+        println!("  примечание: система просит перезагрузку для полного применения");
+    }
+    Ok(())
 }
 
 /// Are we running with administrator rights?
@@ -347,6 +403,26 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(text)
 }
 
+/// Run a tool for its exit code only.
+///
+/// `certutil` prints localized text in the OEM console codepage, which would
+/// arrive as mojibake through our UTF-8 pipe; on success there is nothing worth
+/// showing anyway.
+fn run_quiet(program: &str, args: &[&str]) -> Result<(), String> {
+    let out = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("не удалось запустить {program}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{program} завершился с кодом {}",
+            out.status.code().unwrap_or(-1)
+        ))
+    }
+}
+
 /// Install (or refresh) the WinUSB binding. Requires administrator rights.
 ///
 /// Idempotent: on a machine where the package is already present the AddDriver
@@ -369,16 +445,26 @@ pub fn install() -> Result<(), String> {
     // machine level before PnP will accept the package. Both stores are needed:
     // Root for chain building, TrustedPublisher for the install prompt policy.
     for store in ["Root", "TrustedPublisher"] {
-        let out = run("certutil", &["-addstore", "-f", store, &cer.to_string_lossy()])?;
-        if !out.contains("successfully") && !out.contains("успешно") && !out.contains("already") {
-            // Not fatal on its own; the AddDriver step below is the real judge.
-            eprintln!("  certutil {store}: {}", out.trim());
+        if let Err(e) = run_quiet("certutil", &["-addstore", "-f", store, &cer.to_string_lossy()]) {
+            // Not fatal: if the certificate is already trusted this is a no-op,
+            // and the binding step below is the real judge.
+            eprintln!("  сертификат в {store}: {e}");
         }
     }
 
-    let out = run("pnputil", &["/add-driver", &inf.to_string_lossy(), "/install"])?;
+    let out = run("pnputil", &["/add-driver", &inf.to_string_lossy()])?;
     print!("{}", indent(&out));
 
+    // Adding the package to the store is not the same as binding it: with two
+    // packages matching the same hardware ID, Windows picks by rank and Hantek's
+    // 2017 driver outranks ours (newer DriverVer). That was measured, not
+    // guessed — it put the instrument back on `DSO6CDE` mid-install.
+    if status().found {
+        force_bind(&inf)?;
+    } else {
+        println!("  прибор не подключён: пакет в системе, привязка произойдёт при подключении.");
+        println!("  если прибор воткнут — проверьте кабель и повторите: davinci doctor --fix");
+    }
     let _ = run("pnputil", &["/scan-devices"])?;
 
     // Give PnP a moment, then judge by the only signal that matters.

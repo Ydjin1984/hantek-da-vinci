@@ -326,21 +326,28 @@ pub fn doctor(args: &[String]) -> i32 {
         problems += 1;
     }
 
+    // WinUSB is opened exclusively, so a running copy of this program makes the
+    // device look broken. Check that first and report it as "busy", not "error".
+    let port = remembered_port().unwrap_or(DEFAULT_PORT);
+    let busy = TcpListener::bind(("127.0.0.1", port)).is_err();
+
     if ready {
-        match crate::open() {
-            Ok(_) => println!("  связь     : прибор открылся и прошёл инициализацию"),
-            Err(e) => {
-                println!("  связь     : ОШИБКА — {e}");
-                problems += 1;
+        if busy {
+            println!("  связь     : не проверялась — прибор занят запущенной программой");
+        } else {
+            match crate::open_silent() {
+                Ok(_) => println!("  связь     : прибор открылся и прошёл инициализацию"),
+                Err(e) => {
+                    println!("  связь     : ОШИБКА — {e}");
+                    problems += 1;
+                }
             }
         }
     }
 
-    let port = remembered_port().unwrap_or(DEFAULT_PORT);
-    let busy = TcpListener::bind(("127.0.0.1", port)).is_err();
     println!(
         "  порт      : {port} {}",
-        if busy { "(занят — вероятно, программа уже запущена)" } else { "(свободен)" }
+        if busy { "(занят — программа уже запущена)" } else { "(свободен)" }
     );
     println!("  журналы   : {}", state.join("logs").display());
 
@@ -375,3 +382,4 @@ pub fn doctor(args: &[String]) -> i32 {
     }
     1
 }
+

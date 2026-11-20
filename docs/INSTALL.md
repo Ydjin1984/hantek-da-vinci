@@ -71,8 +71,30 @@ flowchart TD
 |---|---|---|
 | 1 | `certutil -addstore -f Root davinci-libwdi.cer` | корневой сертификат, которым подписан каталог пакета |
 | 2 | `certutil -addstore -f TrustedPublisher davinci-libwdi.cer` | разрешение на установку пакета от этого издателя |
-| 3 | `pnputil /add-driver ydj-2088.inf /install` | сам пакет: `Include=winusb.inf`, `Needs=WINUSB.NT` |
-| 4 | `pnputil /scan-devices` | попросить PnP перечитать устройство |
+| 3 | `pnputil /add-driver ydj-2088.inf` | пакет в хранилище: `Include=winusb.inf`, `Needs=WINUSB.NT` |
+| 4 | `UpdateDriverForPlugAndPlayDevices(…, INSTALLFLAG_FORCE)` | привязка пакета к прибору **в обход ранжирования** |
+| 5 | `pnputil /scan-devices` | попросить PnP перечитать устройство |
+
+### Почему шаг 4 нельзя заменить на `pnputil … /install`
+
+Проверено на живом приборе, а не выведено из документации. Когда к одному
+Hardware ID подходят два пакета, Windows выбирает по ранжированию, а у него в
+числе прочих признаков — `DriverVer`:
+
+| Пакет | `DriverVer` | Кто выбирает |
+|---|---|---|
+| вендорский `oem105.inf` (Hantek) | 09/11/2017 | **Windows, по умолчанию** |
+| `ydj-2088.inf` (WinUSB) | 06/02/2012 | только принудительно |
+
+`pnputil /add-driver … /install` один раз уже переключил прибор обратно на
+`DSO6CDE` прямо во время установки — устройство перечислилось заново, и
+ранжирование выбрало вендорский пакет. Поэтому привязка делается через
+`newdev!UpdateDriverForPlugAndPlayDevices` с флагом `INSTALLFLAG_FORCE` — это та
+же операция, что делает Zadig кнопкой `Replace Driver`.
+
+Тот же урок объясняет, почему `davinci doctor` считает готовностью пару
+«служба = `WinUSB` **и** интерфейс найден»: сразу после смены драйвера в системе
+остаётся устаревшая запись интерфейса, и одной её недостаточно.
 
 ### Про сертификат — честно
 
