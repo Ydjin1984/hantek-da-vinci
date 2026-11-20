@@ -132,6 +132,22 @@ function fmtV(v: number | null): string {
   return `${v.toFixed(3)} В`;
 }
 
+/** Sample rate, in whatever unit keeps the number readable. */
+function fmtRate(r: number): string {
+  if (!(r > 0)) return "—";
+  if (r >= 1e9) return `${(r / 1e9).toFixed(1)} Гвыб/с`;
+  if (r >= 1e6) return `${(r / 1e6).toFixed(1)} Мвыб/с`;
+  if (r >= 1e3) return `${(r / 1e3).toFixed(1)} квыб/с`;
+  return `${r.toFixed(0)} выб/с`;
+}
+
+/** Volts per division, switching to millivolts once the number gets small. */
+function fmtPerDiv(v: number): string {
+  if (v < 0.001) return `${(v * 1e6).toFixed(0)} мкВ/дел`;
+  if (v < 1) return `${(v * 1e3).toFixed(v < 0.01 ? 1 : 0)} мВ/дел`;
+  return `${v.toFixed(1)} В/дел`;
+}
+
 function fmtFreq(f: number | null): string {
   if (!f || !isFinite(f)) return "—";
   if (f >= 1000) return `${(f / 1000).toFixed(2)} кГц`;
@@ -384,7 +400,7 @@ function draw() {
       ctx.font = "500 10px ui-monospace, monospace";
       ctx.fillText(RANGE_LABELS[ch.range_id - 1] ?? ch.range, 12, y0 + 34);
       const perDiv = vppVisible / 8;
-      const scale = `${perDiv.toFixed(perDiv < 1 ? 2 : 1)} В/дел`;
+      const scale = fmtPerDiv(perDiv);
       ctx.fillText(ch.autoscale ? `${scale} авто` : scale, 12, y0 + 47);
 
       // Right: the number that matters — the value right now.
@@ -425,15 +441,32 @@ function draw() {
   ctx.fillText(state.running ? "захват идёт" : "остановлено", w - RIGHT, ry + 17);
 }
 
+/**
+ * Time base, flagged when the instrument cannot honour it.
+ *
+ * The 1008C has 4K of memory and a 2.4 MSa/s ADC, so the fastest sweep it can
+ * really capture is 4000 / 2.4e6 ≈ 1.7 ms. Ask for less and the screen still
+ * shows a waveform, but the x-axis and every frequency reading on it are no
+ * longer what the label claims.
+ */
+function timeDivChip(i: Info): string {
+  const enabled = Math.max(1, state.channels.filter((c) => c.enabled).length);
+  const ceiling = 2.4e6 / enabled;
+  if (i.sample_rate > ceiling * 1.02) {
+    return `<span class="chip bad" title="быстрее предела АЦП (2,4 Мвыб/с, память 4K) — время и частоты здесь недостоверны">${i.time_div} ⚠</span>`;
+  }
+  return `<span class="chip" title="развёртка прибора">${i.time_div}</span>`;
+}
+
 function renderChips() {
   const i = state.info;
   if (!i) return;
-  const rate = i.sample_rate > 0 ? `${(i.sample_rate / 1000).toFixed(1)} квыб/с` : "—";
+  const rate = fmtRate(i.sample_rate);
   const parts = [
     `<span class="chip ${i.error ? "bad" : "ok"}">${i.error ? "нет связи" : "прибор"}</span>`,
     `<span class="chip">${rate}</span>`,
     `<span class="chip">${i.blocks_per_s > 0 ? i.blocks_per_s.toFixed(0) + " блок/с" : "—"}</span>`,
-    `<span class="chip">${i.time_div}</span>`,
+    timeDivChip(i),
   ];
   if (i.log.path) {
     parts.push(
