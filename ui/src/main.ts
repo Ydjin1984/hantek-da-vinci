@@ -45,6 +45,8 @@ type Info = {
   time_div: string;
   time_div_id: number;
   window_s: number;
+  /** the time base asked for more than the ADC can deliver */
+  window_clamped: boolean;
   error: string | null;
   log: { path: string | null; bytes: number; seconds: number };
   blocks_total: number;
@@ -65,6 +67,8 @@ const RANGE_LABELS = ["±0,4 В", "±2,5 В", "±20 В"];
 
 /** Smoothed autoscale mapping per lane; null when the lane keeps its fixed range. */
 const autoScale: ({ center: number; span: number } | null)[] = [null, null, null, null, null, null, null, null];
+/** Target computed once per received frame, so drawing stays cheap. */
+const autoTarget: ({ center: number; span: number } | null)[] = [null, null, null, null, null, null, null, null];
 
 const state = {
   span: 0.2,
@@ -200,8 +204,49 @@ async function fetchFrame() {
     const r = await fetch(`/api/frame?width=${width}&span=${state.span}`);
     const buf = await r.arrayBuffer();
     state.frame = parseFrame(buf);
+    updateAutoTargets();
   } catch {
     /* ignore */
+  }
+}
+
+/**
+ * Full min/max of the frame.
+ *
+ * Deliberately not a percentile: a scope must never hide data, and a genuine
+ * one-sample pulse looks exactly like a glitch. Outliers are handled where they
+ * are created instead — the driver waits for the sweep to finish writing before
+ * reading, which removed them from the source (0 glitches in 3200 channel-blocks).
+ */
+function frameRange(arr: Float32Array, n: number): { lo: number; hi: number } {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let x = 0; x < n; x++) {
+    const a = arr[x * 2];
+    const b = arr[x * 2 + 1];
+    if (a < lo) lo = a;
+    if (a > hi) hi = a;
+    if (b < lo) lo = b;
+    if (b > hi) hi = b;
+  }
+  return { lo, hi };
+}
+
+function updateAutoTargets() {
+  const f = state.frame;
+  if (!f) return;
+  for (let lane = 0; lane < 8; lane++) {
+    const ch = state.channels[lane];
+    const idx = f.chans.indexOf(lane);
+    if (!ch || !ch.autoscale || idx < 0 || f.n === 0 || f.width === 0) {
+      autoTarget[lane] = null;
+      continue;
+    }
+    const r = frameRange(f.data[idx], f.width);
+    autoTarget[lane] = {
+      center: (r.lo + r.hi) / 2,
+      span: Math.max(r.hi - r.lo, 1e-3) * 1.08,
+    };
   }
 }
 
@@ -246,10 +291,22 @@ function resize() {
 const GUTTER = 96;
 const RIGHT = 8;
 const RULER = 26;
-const LANES = 8;
 
+/** Channels that are switched on, as lane indices in draw order. */
+function enabledLanes(): number[] {
+  return state.channels.filter((c) => c.enabled).map((c) => c.ch - 1);
+}
+
+/**
+ * Lane height for the current channel count.
+ *
+ * Every enabled channel gets an equal share of the whole canvas, so one channel
+ * uses the full height and two get half each. Fixed eighth-lanes wasted most of
+ * the screen whenever fewer channels were on, which is why a two-channel picture
+ * was harder to read than a one-channel one.
+ */
 function laneHeight(): number {
-  return (canvas.clientHeight - RULER) / LANES;
+  return (canvas.clientHeight - RULER) / Math.max(1, enabledLanes().length);
 }
 
 function vppOf(resolution: number): number {
@@ -272,13 +329,15 @@ function draw() {
 
   const plotW = w - GUTTER - RIGHT;
 
-  for (let lane = 0; lane < LANES; lane++) {
-    const y0 = lane * lh;
+  const lanes = enabledLanes();
+  for (let pos = 0; pos < lanes.length; pos++) {
+    const lane = lanes[pos];
+    const y0 = pos * lh;
     const ch = state.channels[lane];
-    const enabled = ch ? ch.enabled : false;
+    if (!ch) continue;
     const color = COLORS[lane];
 
-    ctx.fillStyle = lane % 2 ? "#0d1218" : "#0b0f14";
+    ctx.fillStyle = pos % 2 ? "#0d1218" : "#0b0f14";
     ctx.fillRect(0, y0, w, lh);
     ctx.strokeStyle = "#161d26";
     ctx.lineWidth = 1;
@@ -286,15 +345,6 @@ function draw() {
     ctx.moveTo(0, Math.round(y0) + 0.5);
     ctx.lineTo(w, Math.round(y0) + 0.5);
     ctx.stroke();
-
-    if (!enabled || !ch) {
-      ctx.fillStyle = "#2a3442";
-      ctx.font = "500 12px ui-monospace, monospace";
-      ctx.textAlign = "left";
-      ctx.fillText(`CH${lane + 1}`, 14, y0 + lh / 2 + 4);
-      ctx.fillText("выключен", 14 + 44, y0 + lh / 2 + 4);
-      continue;
-    }
 
     const idx = state.frame?.chans.indexOf(lane) ?? -1;
     const arr = idx >= 0 && state.frame ? state.frame.data[idx] : null;
@@ -307,14 +357,8 @@ function draw() {
     const mid = y0 + lh / 2;
     let center = 0; // volts at the middle of the lane
     let vppVisible = vppOf(ch.resolution);
-    if (ch.autoscale && arr && n > 0) {
-      let lo = Infinity;
-      let hi = -Infinity;
-      for (let x = 0; x < n; x++) {
-        if (arr[x * 2] < lo) lo = arr[x * 2];
-        if (arr[x * 2 + 1] > hi) hi = arr[x * 2 + 1];
-      }
-      const target = { center: (hi + lo) / 2, span: Math.max(hi - lo, 1e-3) * 1.12 };
+    const target = ch.autoscale ? autoTarget[lane] : null;
+    if (target) {
       const prev = autoScale[lane];
       const k = 0.35;
       const next = prev
@@ -450,10 +494,8 @@ function draw() {
  * longer what the label claims.
  */
 function timeDivChip(i: Info): string {
-  const enabled = Math.max(1, state.channels.filter((c) => c.enabled).length);
-  const ceiling = 2.4e6 / enabled;
-  if (i.sample_rate > ceiling * 1.02) {
-    return `<span class="chip bad" title="быстрее предела АЦП (2,4 Мвыб/с, память 4K) — время и частоты здесь недостоверны">${i.time_div} ⚠</span>`;
+  if (i.window_clamped) {
+    return `<span class="chip bad" title="развёртка быстрее АЦП (2,4 Мвыб/с, память 4K): реальное окно ${fmtSpan(i.window_s)}">${i.time_div} ⚠</span>`;
   }
   return `<span class="chip" title="развёртка прибора">${i.time_div}</span>`;
 }
@@ -529,9 +571,10 @@ canvas.addEventListener("mouseleave", () => {
 canvas.addEventListener("click", (e) => {
   const rect = canvas.getBoundingClientRect();
   const x = e.clientX - rect.left;
-  const lane = Math.floor((e.clientY - rect.top) / laneHeight());
-  if (x > GUTTER || lane < 0 || lane > 7) return;
-  const ch = lane + 1;
+  const lanes = enabledLanes();
+  const pos = Math.floor((e.clientY - rect.top) / laneHeight());
+  if (x > GUTTER || pos < 0 || pos >= lanes.length) return;
+  const ch = lanes[pos] + 1;
   if (x < 44) toggleChannel(ch);
   else cycleRange(ch);
 });

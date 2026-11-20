@@ -72,6 +72,9 @@ pub struct Status {
     /// Seconds one acquisition covers. This, not the USB throughput, is the
     /// width of the screen and therefore the only honest x-axis label.
     pub window_s: f64,
+    /// True when the time base asks for more than the ADC can deliver, so the
+    /// real window is longer than the one on the dial.
+    pub window_clamped: bool,
     pub error: Option<String>,
     pub log_path: Option<String>,
     pub log_bytes: u64,
@@ -384,7 +387,11 @@ impl EngineHandle {
             blocks_per_s: g.blocks_per_s,
             time_div: g.params.time_div.label(),
             time_div_id: g.params.time_div.id,
-            window_s: g.params.time_div.window_s(),
+            window_s: g.params.time_div.real_window_s(g.params.enabled.len().max(1)),
+            window_clamped: {
+                let n = g.params.enabled.len().max(1);
+                g.params.time_div.real_window_s(n) > g.params.time_div.window_s() * 1.02
+            },
             error: g.error.clone(),
             log_path: g.log.as_ref().map(|l| l.path.display().to_string()),
             log_bytes: g.log.as_ref().map(|l| l.bytes).unwrap_or(0),
@@ -395,23 +402,28 @@ impl EngineHandle {
 
     /// Per-channel statistics as JSON-ready values.
     ///
-    /// Statistics cover the last second, not a single 10 ms block: a 50 Hz
-    /// waveform has one period in 20 ms, so a per-block window would report a
-    /// random slice of it as "Vmax" and make the numbers look unreliable.
+    /// Covers about the last second of *wall clock*, not a single block and not
+    /// the last second of captured signal. One block of 5 ms arrives every ~60 ms,
+    /// so a second of signal is twelve seconds of wall time: the cards then keep
+    /// reporting a peak from a signal that left the screen long ago, while the
+    /// trace shows nothing. Several blocks are still needed, because a 50 Hz
+    /// waveform has one period in 20 ms and a single block would report a random
+    /// slice of it as "Vmax".
     pub fn channels(&self) -> Vec<serde_json::Value> {
         let g = self.inner.lock().unwrap();
-        let rate = if g.info_rate > 0.0 { g.info_rate } else { 50_000.0 };
-        let need = rate as usize;
+        // Roughly one second at the observed block rate, bounded on both sides.
+        let want = (g.blocks_per_s.max(1.0) as usize).clamp(1, 200);
         let mut blocks: Vec<Arc<Block>> = Vec::new();
         let mut total = 0usize;
         for b in g.history.iter().rev() {
             blocks.push(Arc::clone(b));
             total += b.n;
-            if total >= need {
+            if blocks.len() >= want {
                 break;
             }
         }
         blocks.reverse();
+        let rate = if g.info_rate > 0.0 { g.info_rate } else { 50_000.0 };
         let dt = (1.0 / rate) as f32;
 
         (0..CHANNELS)

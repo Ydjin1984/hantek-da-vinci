@@ -22,6 +22,13 @@ pub const ZERO_NOMINAL: f32 = 2048.0;
 /// per-channel split does (8 channels -> 500, 4 -> 1000, 1 -> 4000).
 pub const SAMPLES_PER_SCREEN: usize = 4000;
 
+/// Real-time sampling rate of the whole instrument, in hertz.
+///
+/// From the 1008C datasheet: 2.4 MSa/s, 4K memory, 100 kHz bandwidth. The
+/// measured buffer of 4000 samples matches the 4K memory depth, which is what
+/// makes this number trustworthy enough to compute with.
+pub const ADC_TOTAL_HZ: f64 = 2_400_000.0;
+
 /// Input range, selected per channel by command `0xA2`.
 ///
 /// The value sent to the device is `id` (1..=3). Voltage per ADC count is
@@ -143,12 +150,31 @@ impl TimeDiv {
     /// The time span is fixed by the time base, so the per-channel rate depends on
     /// how many channels are on: 8 channels at 500 µs/div is 500 samples over
     /// 5 ms, one channel is 4000 samples over the same 5 ms.
+    ///
+    /// Above the ADC's own ceiling this saturates. Asking for 1 µs/div would need
+    /// 200 MSa/s per channel with two channels on; the instrument tops out at
+    /// 2.4 MSa/s shared, so it fills the same 4000 samples much more slowly and
+    /// the sweep covers [`real_window_s`](Self::real_window_s).
     pub fn sample_rate(&self, channels: usize) -> f64 {
         if channels == 0 {
             return 0.0;
         }
-        let per_channel = (SAMPLES_PER_SCREEN / channels).max(1);
-        per_channel as f64 / self.window_s()
+        let per_channel = (SAMPLES_PER_SCREEN / channels).max(1) as f64;
+        let demanded = per_channel / self.window_s();
+        let ceiling = ADC_TOTAL_HZ / channels as f64;
+        demanded.min(ceiling)
+    }
+
+    /// Seconds one acquisition really covers.
+    ///
+    /// Equal to the time base whenever the ADC keeps up, longer when it cannot.
+    /// This, not the time base, is what the screen is showing.
+    pub fn real_window_s(&self, channels: usize) -> f64 {
+        let rate = self.sample_rate(channels);
+        if rate <= 0.0 {
+            return self.window_s();
+        }
+        (SAMPLES_PER_SCREEN / channels.max(1)) as f64 / rate
     }
 }
 
@@ -368,6 +394,23 @@ mod tests {
         assert!((Range::V04.full_scale() - 0.41).abs() < 0.01);
         assert_eq!(Range::V20.id(), 3);
         assert_eq!(Range::from_id(1).unwrap(), Range::V04);
+    }
+
+    #[test]
+    fn the_adc_ceiling_stretches_the_window() {
+        // 1 µs/div with two channels would need 200 MSa/s per channel. The
+        // instrument tops out at 2.4 MSa/s shared, so 2000 samples take
+        // 2000 / 1.2e6 ≈ 1.67 ms however the dial is set.
+        let td = TimeDiv::from_id(9).unwrap();
+        assert_eq!(td.ns_per_div, 1_000);
+        assert!((td.window_s() - 1e-5).abs() < 1e-15);
+        assert!((td.sample_rate(2) - 1_200_000.0).abs() < 1.0);
+        assert!((td.real_window_s(2) - 1.666_666_7e-3).abs() < 1e-9);
+
+        // Slow enough for the ADC, the dial is honoured exactly.
+        let slow = TimeDiv::from_id(17).unwrap();
+        assert!((slow.sample_rate(2) - 400_000.0).abs() < 1.0);
+        assert!((slow.real_window_s(2) - slow.window_s()).abs() < 1e-12);
     }
 
     #[test]

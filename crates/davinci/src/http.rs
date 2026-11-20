@@ -68,6 +68,7 @@ fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Res
                 "time_div": st.time_div,
                 "time_div_id": st.time_div_id,
                 "window_s": st.window_s,
+                "window_clamped": st.window_clamped,
                 "error": st.error,
                 "log": {
                     "path": st.log_path,
@@ -177,7 +178,11 @@ fn serve_static(request: Request, assets: &Assets, path: &str) -> std::io::Resul
             Some((body, content_type)) => {
                 let mut resp = Response::from_data(body.to_vec());
                 resp.add_header(header("Content-Type", content_type));
-                resp.add_header(header("Cache-Control", "no-cache"));
+                // The bundle name is content-hashed, but index.html is not, so it
+                // must never be reused: otherwise the tab keeps running the
+                // previous build until it is hard-reloaded.
+                let cc = if rel == "index.html" { "no-store" } else { "no-cache" };
+                resp.add_header(header("Cache-Control", cc));
                 request.respond(resp)
             }
             None => request.respond(Response::empty(404)),
@@ -196,7 +201,8 @@ fn serve_static(request: Request, assets: &Assets, path: &str) -> std::io::Resul
         Ok(bytes) => {
             let mut resp = Response::from_data(bytes);
             resp.add_header(header("Content-Type", mime(&file)));
-            resp.add_header(header("Cache-Control", "no-cache"));
+            let cc = if file.ends_with("index.html") { "no-store" } else { "no-cache" };
+            resp.add_header(header("Cache-Control", cc));
             request.respond(resp)
         }
         Err(_) => request.respond(Response::empty(404)),
