@@ -1,0 +1,24 @@
+[package]
+name = "davinci-setup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Установщик «Осциллограф Хелтег да Винчи»"
+
+# This crate is deliberately outside the main workspace: it embeds the release
+# binary of `davinci`, so building it before `davinci` would bake in a stub and
+# silently ship a broken installer. `tools/build-dist.ps1` builds them in order.
+[workspace]
+
+[[bin]]
+name = "davinci-setup"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

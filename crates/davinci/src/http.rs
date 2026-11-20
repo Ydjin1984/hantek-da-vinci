@@ -9,7 +9,16 @@ use hantek1008::{Range, TimeDiv};
 use std::path::{Path, PathBuf};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-pub fn serve(port: u16, ui_dir: PathBuf, eng: EngineHandle) -> ! {
+/// Where the interface comes from.
+///
+/// The shipped program carries it inside the executable; `--ui <dir>` still
+/// works for development, where a Vite rebuild should be visible on refresh.
+pub enum Assets {
+    Embedded,
+    Dir(PathBuf),
+}
+
+pub fn serve(port: u16, assets: Assets, eng: EngineHandle) -> ! {
     let addr = format!("127.0.0.1:{port}");
     let server = match Server::http(&addr) {
         Ok(s) => s,
@@ -18,16 +27,15 @@ pub fn serve(port: u16, ui_dir: PathBuf, eng: EngineHandle) -> ! {
             std::process::exit(1);
         }
     };
-    println!("UI:   http://{addr}/");
     for request in server.incoming_requests() {
-        if let Err(e) = handle(request, &ui_dir, &eng) {
+        if let Err(e) = handle(request, &assets, &eng) {
             eprintln!("http: {e}");
         }
     }
     unreachable!()
 }
 
-fn handle(request: Request, ui_dir: &Path, eng: &EngineHandle) -> std::io::Result<()> {
+fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Result<()> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -129,15 +137,29 @@ fn handle(request: Request, ui_dir: &Path, eng: &EngineHandle) -> std::io::Resul
             }
             json(request, "{\"ok\":true}")
         }
-        _ => serve_static(request, ui_dir, &path),
+        _ => serve_static(request, assets, &path),
     }
 }
 
-fn serve_static(request: Request, ui_dir: &Path, path: &str) -> std::io::Result<()> {
+fn serve_static(request: Request, assets: &Assets, path: &str) -> std::io::Result<()> {
     let rel = if path == "/" || path.is_empty() { "index.html" } else { path.trim_start_matches('/') };
     if rel.contains("..") {
         return request.respond(Response::empty(403));
     }
+
+    if let Assets::Embedded = assets {
+        return match crate::assets::lookup(rel) {
+            Some((body, content_type)) => {
+                let mut resp = Response::from_data(body.to_vec());
+                resp.add_header(header("Content-Type", content_type));
+                resp.add_header(header("Cache-Control", "no-cache"));
+                request.respond(resp)
+            }
+            None => request.respond(Response::empty(404)),
+        };
+    }
+
+    let Assets::Dir(ui_dir) = assets else { unreachable!() };
     let file = ui_dir.join(rel);
     let file = if file.exists() {
         file

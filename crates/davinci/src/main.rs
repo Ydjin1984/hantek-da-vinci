@@ -1,28 +1,39 @@
 //! Command line entry point.
 //!
-//! `davinci info` checks the link, `davinci serve` runs the daemon and the UI,
+//! With no arguments this starts the program a person installs: the interface is
+//! baked into the executable, the browser opens by itself, and a missing
+//! instrument produces a window that says so rather than an error.
+//!
+//! `davinci info` checks the link, `davinci doctor` explains the whole chain,
 //! `--sim` swaps the hardware for a deterministic simulator so the UI and the
 //! logging path can be exercised on any machine.
 
+mod app;
+mod assets;
+mod driver;
 mod engine;
 mod http;
+mod install;
 
-use engine::Engine;
 use hantek1008::protocol::Measure;
-use hantek1008::sim::SimTransport;
 use hantek1008::{Device, Range, TimeDiv, CHANNELS};
-use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("info");
+    let cmd = args.first().map(String::as_str).unwrap_or("");
     let code = match cmd {
+        // No arguments: this is the program, not a subcommand.
+        "" => app::run(&[]),
+        "run" | "serve" => app::run(&args[1..]),
+        "doctor" => app::doctor(&args[1..]),
+        "driver" => driver::cmd(&args[1..]),
+        "install" => install::cmd(&args[1..]),
+        "uninstall" => install::uninstall(&args[1..]),
         "info" => info(),
         "capture" => capture(&args[1..]),
         "zero" => zero(&args[1..]),
         "raw" => raw(&args[1..]),
         "dump" => dump(&args[1..]),
-        "serve" => serve(&args[1..]),
         #[cfg(windows)]
         "paths" => {
             for p in hantek1008::transport::winusb::device_paths() {
@@ -34,6 +45,9 @@ fn main() {
             usage();
             0
         }
+        // `davinci --sim`, `davinci --port 7500`: a bare flag is still "run",
+        // not an unknown command.
+        other if other.starts_with('-') && other != "-h" => app::run(&args),
         other => {
             eprintln!("неизвестная команда: {other}");
             usage();
@@ -45,19 +59,30 @@ fn main() {
 
 fn usage() {
     println!(
-        "davinci — осциллограф Хелтег да Винчи (Hantek 1008C)
+        "Осциллограф Хелтег да Винчи (Hantek 1008C) {version}
 
+  davinci                         запустить программу и интерфейс
+  davinci --sim                   то же на симуляторе, без прибора
+  davinci doctor                  диагноз: прибор, драйвер, интерфейс, порт
+  davinci driver status           что за драйвер сейчас владеет прибором
+  davinci driver install          поставить WinUSB (нужен администратор)
+  davinci install [--dir D]       установить программу в систему
+  davinci uninstall [--purge]     удалить программу
   davinci info                    проверить связь, измерить реальную частоту
   davinci capture [N] [ch,ch]     снять N блоков и напечатать измерения
   davinci zero [N]                измерить нули АЦП (входы на землю!)
-  davinci serve [--sim] [--port P] [--ui DIR]
-                                  запустить демон и веб-интерфейс
   davinci paths                   показать пути устройств WinUSB
-"
+
+  --port P    порт интерфейса (по умолчанию {port})
+  --no-open   не открывать браузер
+  --multi     разрешить второй экземпляр
+",
+        version = env!("CARGO_PKG_VERSION"),
+        port = app::DEFAULT_PORT
     );
 }
 
-fn open() -> Result<Device, String> {
+pub(crate) fn open() -> Result<Device, String> {
     let mut dev = Device::open().map_err(|e| {
         format!(
             "не удалось открыть прибор: {e}\n\
@@ -238,61 +263,7 @@ fn zero(args: &[String]) -> i32 {
     }
 }
 
-fn serve(args: &[String]) -> i32 {
-    let sim = args.iter().any(|a| a == "--sim");
-    let port: u16 = arg_value(args, "--port").and_then(|v| v.parse().ok()).unwrap_or(7411);
-    let ui = arg_value(args, "--ui").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("ui/dist"));
-
-    let mut dev = if sim {
-        println!("режим симулятора: железо не используется");
-        // The simulator has a fixed time base; let the engine trust it.
-        std::env::set_var("DAVINCI_FIXED_RATE", "50000");
-        let mut d = Device::with_transport(Box::new(SimTransport::new()));
-        d.set_channels(&(0..CHANNELS).collect::<Vec<_>>()).unwrap();
-        d.info.link = "simulator".into();
-        d
-    } else {
-        match open() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("{e}");
-                eprintln!("подсказка: запустите с --sim, чтобы посмотреть интерфейс без прибора");
-                return 1;
-            }
-        }
-    };
-
-    if !sim {
-        match dev.measure_rate(8) {
-            Ok(i) => println!(
-                "частота: {:.0} Гц/канал, {} сэмплов в блоке, {:.0} блоков/с",
-                i.sample_rate, i.block_samples, i.blocks_per_s
-            ),
-            Err(e) => {
-                eprintln!("не удалось измерить частоту: {e}");
-                return 1;
-            }
-        }
-    } else {
-        // The simulator answers with 2000 samples per channel per block.
-        dev.info.sample_rate = 50_000.0;
-        dev.info.block_samples = 500;
-        dev.info.blocks_per_s = 100.0;
-    }
-
-    let calib_path = PathBuf::from("calibration.json");
-    dev.calib = hantek1008::Calibration::load(&calib_path);
-    if dev.calib.measured_at.is_some() {
-        println!("калибровка нулей загружена из {}", calib_path.display());
-    }
-
-    let eng = Engine::new(&dev);
-    let handle = eng.handle();
-    std::thread::spawn(move || eng.run(dev));
-    http::serve(port, ui, handle)
-}
-
-fn arg_value(args: &[String], key: &str) -> Option<String> {
+pub(crate) fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).cloned()
 }
 

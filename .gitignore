@@ -1,7 +1,11 @@
 /target
 /tools/probe/target
+/crates/setup/target
 **/*.rs.bk
 /ui/node_modules
+# Готовые к раздаче файлы: их собирает tools/build-dist.ps1, в репозитории
+# им не место — иначе каждая сборка давала бы бинарный diff на мегабайт.
+/dist
 /logs
 *.log
 *.err

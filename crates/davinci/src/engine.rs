@@ -126,6 +126,34 @@ impl Engine {
         }
     }
 
+    /// An engine for a program that has no instrument (yet).
+    ///
+    /// It never produces samples: the status carries the reason and `run` is
+    /// simply not called. This exists so the window opens and explains itself
+    /// instead of the process exiting on a missing cable.
+    pub fn offline(link: String, error: String) -> Engine {
+        Engine {
+            inner: Arc::new(Mutex::new(Inner {
+                params: Params::default(),
+                calib: Calibration::default(),
+                history: VecDeque::new(),
+                peaks: [Peak { min: f32::INFINITY, max: f32::NEG_INFINITY }; CHANNELS],
+                info_rate: 0.0,
+                block_samples: 0,
+                blocks_per_s: 0.0,
+                link,
+                error: Some(error),
+                log: None,
+                started: Instant::now(),
+                blocks_total: 0,
+                frame_counter: 0,
+            })),
+            running: Arc::new(AtomicBool::new(false)),
+            seq: Arc::new(AtomicU64::new(0)),
+            reset_peaks: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn handle(&self) -> EngineHandle {
         EngineHandle {
             inner: Arc::clone(&self.inner),
