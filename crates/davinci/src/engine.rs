@@ -24,11 +24,19 @@ pub struct Params {
     pub enabled: Vec<usize>,
     pub ranges: [Range; CHANNELS],
     pub time_div: TimeDiv,
+    /// Fit each channel's trace to its whole lane. A display setting: the device
+    /// never sees it, but it is part of the state that must survive a restart.
+    pub autoscale: [bool; CHANNELS],
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Params { enabled: (0..CHANNELS).collect(), ranges: [Range::V20; CHANNELS], time_div: TimeDiv::DEFAULT }
+        Params {
+            enabled: (0..CHANNELS).collect(),
+            ranges: [Range::V20; CHANNELS],
+            time_div: TimeDiv::DEFAULT,
+            autoscale: [false; CHANNELS],
+        }
     }
 }
 
@@ -111,6 +119,7 @@ impl Engine {
                     enabled: dev.enabled.clone(),
                     ranges: dev.ranges,
                     time_div: dev.time_div,
+                    autoscale: [false; CHANNELS],
                 },
                 calib: dev.calib.clone(),
                 history: VecDeque::new(),
@@ -177,6 +186,7 @@ impl Engine {
             enabled: dev.enabled.clone(),
             ranges: dev.ranges,
             time_div: dev.time_div,
+            autoscale: [false; CHANNELS],
         };
         let mut last_rate_check = Instant::now();
         let mut blocks_at_check = 0u64;
@@ -269,23 +279,99 @@ impl EngineHandle {
         if !chans.is_empty() {
             g.params.enabled = chans;
         }
+        g.persist();
     }
 
     /// Change the hardware time base, the way a scope's time/div knob does.
     pub fn set_time_div(&self, td: TimeDiv) {
         let mut g = self.inner.lock().unwrap();
         g.params.time_div = td;
+        g.persist();
     }
 
-    pub fn set_range(&self, ch: usize, range: Range) {        let mut g = self.inner.lock().unwrap();
+    pub fn set_range(&self, ch: usize, range: Range) {
+        let mut g = self.inner.lock().unwrap();
         if ch < CHANNELS {
             g.params.ranges[ch] = range;
         }
+        g.persist();
     }
 
     pub fn set_range_all(&self, range: Range) {
         let mut g = self.inner.lock().unwrap();
         g.params.ranges = [range; CHANNELS];
+        g.persist();
+    }
+
+    /// Fit one channel, or all of them, to the full height of their lane.
+    pub fn set_autoscale(&self, ch: Option<usize>, on: bool) {
+        let mut g = self.inner.lock().unwrap();
+        match ch {
+            Some(c) if c < CHANNELS => g.params.autoscale[c] = on,
+            Some(_) => {}
+            None => g.params.autoscale = [on; CHANNELS],
+        }
+        g.persist();
+    }
+
+    /// Everything currently held in memory as CSV, for the "Экспорт" button.
+    ///
+    /// Wide format, one row per sample: the first columns are the acquisition
+    /// number and the time inside it, the rest are one column per enabled
+    /// channel. Time is relative to the start of the sweep, because consecutive
+    /// acquisitions are not contiguous and absolute time would imply they are.
+    pub fn export_csv(&self) -> String {
+        let g = self.inner.lock().unwrap();
+        let enabled = g.params.enabled.clone();
+        let rate = if g.info_rate > 0.0 { g.info_rate } else { 1.0 };
+        let dt_ms = 1000.0 / rate;
+
+        let mut out = String::with_capacity(1 << 16);
+        out.push_str("# Осциллограф Хелтег да Винчи · экспорт данных\n");
+        out.push_str(&format!("# развёртка: {}\n", g.params.time_div.label()));
+        out.push_str(&format!("# частота: {rate:.0} Гц на канал\n"));
+        for &c in &enabled {
+            let r = g.params.ranges[c];
+            out.push_str(&format!("# CH{}: {} ({})\n", c + 1, r.label(), r.id()));
+        }
+        out.push_str("seq,t_ms");
+        for &c in &enabled {
+            out.push_str(&format!(",CH{}", c + 1));
+        }
+        out.push('\n');
+
+        for b in &g.history {
+            // Only blocks acquired with exactly this channel set: a block taken
+            // while a channel was off has no data for it, and mixing the two
+            // produces columns with holes that look like dropouts.
+            if !enabled.iter().all(|&c| b.ch[c].is_some()) {
+                continue;
+            }
+            for i in 0..b.n {
+                out.push_str(&format!("{},{:.6}", b.seq, i as f64 * dt_ms));
+                for &c in &enabled {
+                    out.push(',');
+                    if let Some(raw) = b.ch[c].as_ref().and_then(|r| r.get(i)) {
+                        let range = g.params.ranges[c];
+                        let zero = g.calib.zero(range, c);
+                        let v = (*raw as f32 - zero) * range.volt_per_count();
+                        out.push_str(&format!("{v:.4}"));
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Put back the settings read from disk at startup, without writing them
+    /// straight back out again.
+    pub fn restore(&self, s: &crate::settings::Settings) {
+        let mut g = self.inner.lock().unwrap();
+        g.params.autoscale = [false; CHANNELS];
+        for (i, slot) in g.params.autoscale.iter_mut().enumerate() {
+            *slot = s.autoscale.get(i).copied().unwrap_or(false);
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -344,6 +430,7 @@ impl EngineHandle {
                 serde_json::json!({
                     "ch": ch + 1,
                     "enabled": g.params.enabled.contains(&ch),
+                    "autoscale": g.params.autoscale[ch],
                     "range_id": range.id(),
                     "range": range.label(),
                     "resolution": range.resolution(),
@@ -467,6 +554,21 @@ impl EngineHandle {
             let _ = l.writer.flush();
             let _ = l.writer.get_ref().sync_all();
         }
+    }
+}
+
+impl Inner {
+    /// Write the current state to disk so the next start comes up the same way.    ///
+    /// Called on every user change rather than on exit: the program is closed by
+    /// killing the browser tab or the machine, and neither runs a shutdown path.
+    fn persist(&self) {
+        crate::settings::Settings {
+            enabled: self.params.enabled.clone(),
+            ranges: self.params.ranges.iter().map(|r| r.id()).collect(),
+            time_div_id: self.params.time_div.id,
+            autoscale: self.params.autoscale.to_vec(),
+        }
+        .save();
     }
 }
 

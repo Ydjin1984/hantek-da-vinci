@@ -262,6 +262,51 @@ main {
   color: var(--muted);
 }
 
+.auto {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  font-family: var(--mono);
+  cursor: pointer;
+  user-select: none;
+}
+
+.auto input {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+}
+
+.auto input:checked {
+  border-color: var(--c);
+  background: color-mix(in srgb, var(--c) 35%, transparent);
+}
+
+.auto input:checked::after {
+  content: "";
+  position: absolute;
+  left: 2.5px;
+  top: 0.5px;
+  width: 4px;
+  height: 7px;
+  border-right: 2px solid var(--c);
+  border-bottom: 2px solid var(--c);
+  transform: rotate(40deg);
+}
+
+.auto input:checked + span {
+  color: var(--c);
+}
+
 .row b {
   color: #b9c8da;
   font-family: var(--mono);

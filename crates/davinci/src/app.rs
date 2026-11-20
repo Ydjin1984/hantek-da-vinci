@@ -178,8 +178,22 @@ pub fn run(args: &[String]) -> i32 {
                 println!("калибровка нулей: {}", calib_path.display());
             }
 
+            // Last state from the previous run: which channels were on, their
+            // ranges, the time base. Applied to the instrument before the engine
+            // starts so the very first acquisition is already the right one.
+            let settings = crate::settings::Settings::load();
+            settings.apply(&mut dev);
+            println!(
+                "настройки: каналы {:?}, развёртка {}",
+                settings.enabled.iter().map(|c| c + 1).collect::<Vec<_>>(),
+                hantek1008::TimeDiv::from_id(settings.time_div_id)
+                    .map(|t| t.label())
+                    .unwrap_or_else(|_| "—".into())
+            );
+
             let engine = Engine::new(&dev);
             let handle = engine.handle();
+            handle.restore(&settings);
             std::thread::spawn(move || engine.run(dev));
             handle
         }

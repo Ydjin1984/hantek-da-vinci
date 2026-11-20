@@ -92,6 +92,15 @@ fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Res
             resp.add_header(header("Cache-Control", "no-store"));
             request.respond(resp)
         }
+        "/api/export.csv" => {
+            let body = eng.export_csv();
+            let name = format!("attachment; filename=\"davinci-{}.csv\"", crate::engine::now_unix());
+            let mut resp = Response::from_data(body.into_bytes());
+            resp.add_header(header("Content-Type", "text/csv; charset=utf-8"));
+            resp.add_header(header("Content-Disposition", &name));
+            resp.add_header(header("Cache-Control", "no-store"));
+            request.respond(resp)
+        }
         "/api/control" => {
             let cmd = get("cmd").unwrap_or_default();
             match cmd.as_str() {
@@ -114,6 +123,13 @@ fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Res
                             eng.set_time_div(td);
                         }
                     }
+                }
+                "autoscale" => {
+                    let on = get("on").map(|v| v == "1" || v == "true").unwrap_or(false);
+                    let ch = get("ch")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .map(|c| c.saturating_sub(1));
+                    eng.set_autoscale(ch, on);
                 }
                 "range" => {
                     if let (Some(ch), Some(r)) = (get("ch"), get("r")) {

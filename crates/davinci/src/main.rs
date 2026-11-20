@@ -14,6 +14,7 @@ mod driver;
 mod engine;
 mod http;
 mod install;
+mod settings;
 
 use hantek1008::protocol::Measure;
 use hantek1008::{Device, Range, TimeDiv, CHANNELS};

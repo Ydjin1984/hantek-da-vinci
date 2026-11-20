@@ -19,6 +19,8 @@ window.addEventListener("unhandledrejection", (e) => {
 type ChannelInfo = {
   ch: number;
   enabled: boolean;
+  /** fit this channel to the full height of its lane */
+  autoscale: boolean;
   range_id: number;
   range: string;
   resolution: number;
@@ -61,6 +63,9 @@ const COLORS = [
 
 const RANGE_LABELS = ["±0,4 В", "±2,5 В", "±20 В"];
 
+/** Smoothed autoscale mapping per lane; null when the lane keeps its fixed range. */
+const autoScale: ({ center: number; span: number } | null)[] = [null, null, null, null, null, null, null, null];
+
 const state = {
   span: 0.2,
   running: true,
@@ -97,6 +102,7 @@ app.innerHTML = `
       <button id="btn-run" class="btn primary">Стоп</button>
       <button id="btn-reset" class="btn">Сброс пиков</button>
       <button id="btn-log" class="btn">Лог</button>
+      <button id="btn-export" class="btn" title="скачать записанные отсчёты в CSV">Экспорт</button>
     </div>
   </header>
   <main>
@@ -117,6 +123,7 @@ const hint = document.getElementById("hint")!;
 const btnRun = document.getElementById("btn-run") as HTMLButtonElement;
 const btnReset = document.getElementById("btn-reset") as HTMLButtonElement;
 const btnLog = document.getElementById("btn-log") as HTMLButtonElement;
+const btnExport = document.getElementById("btn-export") as HTMLButtonElement;
 
 function fmtV(v: number | null): string {
   if (v === null || !isFinite(v)) return "—";
@@ -273,10 +280,42 @@ function draw() {
       continue;
     }
 
-    // Vertical grid: 8 divisions across the lane, like the hardware screen.
-    const vpp = vppOf(ch.resolution);
+    const idx = state.frame?.chans.indexOf(lane) ?? -1;
+    const arr = idx >= 0 && state.frame ? state.frame.data[idx] : null;
+    const n = state.frame?.width ?? 0;
+
+    // Vertical scale. Without autoscale it is the hardware range and fixed, so
+    // the same volts land in the same place on every channel. With autoscale the
+    // lane is fitted to what is actually there, and the mapping is smoothed so a
+    // moving trace does not breathe.
     const mid = y0 + lh / 2;
-    const pxPerV = (lh - 8) / vpp;
+    let center = 0; // volts at the middle of the lane
+    let vppVisible = vppOf(ch.resolution);
+    if (ch.autoscale && arr && n > 0) {
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let x = 0; x < n; x++) {
+        if (arr[x * 2] < lo) lo = arr[x * 2];
+        if (arr[x * 2 + 1] > hi) hi = arr[x * 2 + 1];
+      }
+      const target = { center: (hi + lo) / 2, span: Math.max(hi - lo, 1e-3) * 1.12 };
+      const prev = autoScale[lane];
+      const k = 0.35;
+      const next = prev
+        ? {
+            center: prev.center + (target.center - prev.center) * k,
+            span: prev.span + (target.span - prev.span) * k,
+          }
+        : target;
+      autoScale[lane] = next;
+      center = next.center;
+      vppVisible = next.span;
+    } else {
+      autoScale[lane] = null;
+    }
+    const pxPerV = (lh - 8) / vppVisible;
+    const yOf = (volts: number) => mid - (volts - center) * pxPerV;
+
     ctx.strokeStyle = "#151c25";
     for (let d = 1; d < 8; d++) {
       const y = y0 + (lh * d) / 8;
@@ -285,26 +324,26 @@ function draw() {
       ctx.lineTo(w - RIGHT, Math.round(y) + 0.5);
       ctx.stroke();
     }
-    ctx.save();
-    ctx.setLineDash([3, 4]);
-    ctx.strokeStyle = "#26313f";
-    ctx.beginPath();
-    ctx.moveTo(GUTTER, Math.round(mid) + 0.5);
-    ctx.lineTo(w - RIGHT, Math.round(mid) + 0.5);
-    ctx.stroke();
-    ctx.restore();
+    // A dashed zero line only means something when the scale is fixed to a range.
+    if (!ch.autoscale) {
+      ctx.save();
+      ctx.setLineDash([3, 4]);
+      ctx.strokeStyle = "#26313f";
+      ctx.beginPath();
+      ctx.moveTo(GUTTER, Math.round(mid) + 0.5);
+      ctx.lineTo(w - RIGHT, Math.round(mid) + 0.5);
+      ctx.stroke();
+      ctx.restore();
+    }
 
-    const idx = state.frame?.chans.indexOf(lane) ?? -1;
-    if (idx >= 0 && state.frame) {
-      const arr = state.frame.data[idx];
-      const n = state.frame.width;
+    if (arr && n > 0) {
 
       // Peak-hold: never reset unless asked, so a one-off spike stays visible.
       if (ch.peak_min !== null && ch.peak_max !== null) {
         ctx.strokeStyle = color + "55";
         ctx.setLineDash([2, 6]);
         for (const v of [ch.peak_min, ch.peak_max]) {
-          const y = mid - v * pxPerV;
+          const y = yOf(v);
           if (y > y0 + 1 && y < y0 + lh - 1) {
             ctx.beginPath();
             ctx.moveTo(GUTTER, y);
@@ -321,8 +360,8 @@ function draw() {
       for (let x = 0; x < n; x++) {
         const lo = arr[x * 2];
         const hi = arr[x * 2 + 1];
-        const yl = mid - hi * pxPerV;
-        const yh = mid - lo * pxPerV;
+        const yl = yOf(hi);
+        const yh = yOf(lo);
         const top = Math.max(y0 + 1, Math.min(yl, yh));
         const bot = Math.min(y0 + lh - 1, Math.max(yl, yh));
         const px = GUTTER + x * step;
@@ -344,7 +383,9 @@ function draw() {
       ctx.fillStyle = "#7d8da3";
       ctx.font = "500 10px ui-monospace, monospace";
       ctx.fillText(RANGE_LABELS[ch.range_id - 1] ?? ch.range, 12, y0 + 34);
-      ctx.fillText(`${(vpp / 8).toFixed(vpp / 8 < 1 ? 2 : 1)} В/дел`, 12, y0 + 47);
+      const perDiv = vppVisible / 8;
+      const scale = `${perDiv.toFixed(perDiv < 1 ? 2 : 1)} В/дел`;
+      ctx.fillText(ch.autoscale ? `${scale} авто` : scale, 12, y0 + 47);
 
       // Right: the number that matters — the value right now.
       const now = arr[(n - 1) * 2 + 1];
@@ -414,6 +455,10 @@ function renderCards() {
           <span class="range" data-act="range" title="клик — сменить диапазон">${c.range}</span>
         </div>
         <div class="big">${fmtV(c.max)}</div>
+        <label class="auto" title="растянуть дорожку на всю высоту">
+          <input type="checkbox" data-act="auto"${c.autoscale ? " checked" : ""}>
+          <span>авто</span>
+        </label>
         <div class="row"><span>Vmin</span><b>${fmtV(c.min)}</b></div>
         <div class="row"><span>Vmax</span><b>${fmtV(c.max)}</b></div>
         <div class="row"><span>Vpp</span><b>${fmtV(c.pp)}</b></div>
@@ -467,6 +512,21 @@ cards.addEventListener("click", (e) => {
   if (el.dataset.act === "range") cycleRange(ch);
 });
 
+cards.addEventListener("change", (e) => {
+  const el = e.target as HTMLInputElement;
+  if (el.dataset.act !== "auto") return;
+  const card = el.closest(".card") as HTMLElement | null;
+  if (!card) return;
+  const ch = Number(card.dataset.ch);
+  const on = el.checked;
+  fetch(`/api/control?cmd=autoscale&ch=${ch}&on=${on ? 1 : 0}`).catch(() => {});
+  const c = state.channels.find((x) => x.ch === ch);
+  if (c) c.autoscale = on;
+  // Drop the smoothed mapping so the lane snaps to its new scale instead of
+  // sliding there over a second.
+  autoScale[ch - 1] = null;
+});
+
 function toggleChannel(ch: number) {
   const enabled = state.channels.filter((c) => c.enabled).map((c) => c.ch);
   const next = enabled.includes(ch) ? enabled.filter((c) => c !== ch) : [...enabled, ch].sort((a, b) => a - b);
@@ -494,6 +554,12 @@ btnRun.addEventListener("click", () => {
 });
 
 btnReset.addEventListener("click", () => fetch("/api/control?cmd=reset"));
+
+btnExport.addEventListener("click", () => {
+  // The response carries Content-Disposition, so handing the URL to the browser
+  // saves it as a file instead of navigating to it.
+  window.location.href = "/api/export.csv";
+});
 
 btnLog.addEventListener("click", () => {
   fetch(`/api/control?cmd=${state.logOn ? "log_stop" : "log_start"}`);
