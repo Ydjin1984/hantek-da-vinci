@@ -145,6 +145,28 @@ extern "system" {
 }
 
 const PIPE_TRANSFER_TIMEOUT: u32 = 3;
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+const ERROR_IO_PENDING: u32 = 997;
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 0x102;
+
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: Handle,
+}
+
+extern "system" {
+    fn CreateEventA(security: *mut c_void, manual: i32, initial: i32, name: *const u8) -> Handle;
+    fn ResetEvent(h: Handle) -> i32;
+    fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
+    fn GetOverlappedResult(h: Handle, ov: *mut Overlapped, transferred: *mut u32, wait: i32) -> i32;
+    fn SetLastError(code: u32);
+    fn CancelIoEx(h: Handle, ov: *mut c_void) -> i32;
+}
 
 fn last_error() -> u32 {
     unsafe { GetLastError() }
@@ -221,57 +243,88 @@ pub fn device_paths() -> Vec<String> {
     out
 }
 
-/// Open the first scope bound to WinUSB.
+/// Open the first scope bound to WinUSB, waiting briefly for re-enumeration.
+///
+/// The device logically disconnects after ~7 s without commands and then
+/// re-appears; a caller that arrives during that window would otherwise see
+/// "not found" for a device that is physically plugged in.
 pub fn open_first() -> Result<WinUsbTransport> {
-    let paths = device_paths();
-    if paths.is_empty() {
-        return Err(Error::NoDevice);
-    }
-    let mut last = None;
-    for p in &paths {
-        match WinUsbTransport::open(p) {
-            Ok(t) => return Ok(t),
-            Err(e) => last = Some(e),
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    let mut last: Option<Error> = None;
+    loop {
+        let paths = device_paths();
+        if paths.is_empty() {
+            last = Some(Error::NoDevice);
         }
+        for p in &paths {
+            match WinUsbTransport::open(p) {
+                Ok(t) => return Ok(t),
+                Err(e) => last = Some(e),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(last.unwrap_or(Error::NoDevice));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    Err(last.unwrap_or(Error::NoDevice))
 }
 
 /// Raw bulk access through `winusb.dll`.
 pub struct WinUsbTransport {
     device: Handle,
     iface: Handle,
+    event: Handle,
     ep_in: u8,
     ep_out: u8,
     path: String,
+    overlapped: bool,
 }
 
 unsafe impl Send for WinUsbTransport {}
 
 impl WinUsbTransport {
     pub fn open(path: &str) -> Result<WinUsbTransport> {
+        // Some WinUSB builds only hand out an interface handle when the file
+        // handle was opened for overlapped I/O; others are happy with a plain
+        // synchronous handle. Try the simple one first, then the other, and
+        // report both failures if neither works.
+        match Self::open_with(path, 0) {
+            Ok(t) => Ok(t),
+            Err(first) => match Self::open_with(path, FILE_FLAG_OVERLAPPED) {
+                Ok(t) => Ok(t),
+                Err(second) => Err(Error::Protocol(format!(
+                    "WinUSB не принял устройство: {first} / {second}"
+                ))),
+            },
+        }
+    }
+
+    fn open_with(path: &str, flags: u32) -> Result<WinUsbTransport> {
         let c = CString::new(path).map_err(|_| Error::Protocol("path contains NUL".into()))?;
+        let overlapped = flags & FILE_FLAG_OVERLAPPED != 0;
         unsafe {
-            // Synchronous handle: WinUsb calls block until the transfer is done,
-            // which keeps the state machine simple.
+            SetLastError(0);
             let device = CreateFileA(
                 c.as_ptr() as *const u8,
                 GENERIC_READ_WRITE,
                 FILE_SHARE_RW,
                 ptr::null_mut(),
                 OPEN_EXISTING,
-                0,
+                flags,
                 ptr::null_mut(),
             );
             if device == (-1isize) as Handle {
-                // 32 = sharing violation: the vendor application still owns it.
                 return Err(Error::Win32 { call: "CreateFileA", code: last_error() });
             }
+            SetLastError(0);
             let mut iface: Handle = ptr::null_mut();
             if WinUsb_Initialize(device, &mut iface) == 0 {
                 let e = last_error();
                 CloseHandle(device);
-                return Err(Error::Win32 { call: "WinUsb_Initialize", code: e });
+                return Err(Error::Win32 {
+                    call: if overlapped { "WinUsb_Initialize(overlapped)" } else { "WinUsb_Initialize" },
+                    code: e,
+                });
             }
 
             let mut desc = UsbInterfaceDescriptor::default();
@@ -315,57 +368,174 @@ impl WinUsbTransport {
                 );
             }
 
-            Ok(WinUsbTransport { device, iface, ep_in, ep_out, path: path.to_string() })
+            let event = if overlapped {
+                let e = CreateEventA(ptr::null_mut(), 1, 0, ptr::null());
+                if e.is_null() {
+                    WinUsb_Free(iface);
+                    CloseHandle(device);
+                    return Err(Error::Win32 { call: "CreateEventA", code: last_error() });
+                }
+                e
+            } else {
+                ptr::null_mut()
+            };
+
+            Ok(WinUsbTransport { device, iface, event, ep_in, ep_out, path: path.to_string(), overlapped })
+        }
+    }
+
+    /// Read up to `max` bytes, giving up after `timeout_ms` of silence.
+    pub fn read_available(&mut self, max: usize, timeout_ms: u64) -> Result<Vec<u8>> {
+        if !self.overlapped {
+            return Ok(Vec::new());
+        }
+        unsafe {
+            ResetEvent(self.event);
+            let mut ov = Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                h_event: self.event,
+            };
+            let mut buf = vec![0u8; max.max(1)];
+            let mut done = 0u32;
+            let ovp = &mut ov as *mut Overlapped as *mut c_void;
+            let ok = WinUsb_ReadPipe(
+                self.iface,
+                self.ep_in,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut done,
+                ovp,
+            );
+            if ok == 0 && last_error() != ERROR_IO_PENDING {
+                return Ok(Vec::new());
+            }
+            match WaitForSingleObject(self.event, timeout_ms as u32) {
+                WAIT_OBJECT_0 => {
+                    let mut n = 0u32;
+                    if GetOverlappedResult(self.device, &mut ov, &mut n, 0) == 0 {
+                        return Ok(Vec::new());
+                    }
+                    buf.truncate(n as usize);
+                    Ok(buf)
+                }
+                _ => {
+                    // Nothing arrived in time: cancel the pending read and reap
+                    // it before the buffer goes out of scope, otherwise the
+                    // cancelled IRP would write into freed memory.
+                    let _ = CancelIoEx(self.device, ovp);
+                    let _ = WaitForSingleObject(self.event, 200);
+                    let mut n = 0u32;
+                    let _ = GetOverlappedResult(self.device, &mut ov, &mut n, 1);
+                    Ok(Vec::new())
+                }
+            }
+        }
+    }
+
+    fn transfer(&mut self, is_write: bool, buf: &mut [u8]) -> Result<usize> {
+        let mut done = 0u32;
+        if !self.overlapped {
+            let ok = unsafe {
+                if is_write {
+                    WinUsb_WritePipe(self.iface, self.ep_out, buf.as_ptr(), buf.len() as u32, &mut done, ptr::null_mut())
+                } else {
+                    WinUsb_ReadPipe(self.iface, self.ep_in, buf.as_mut_ptr(), buf.len() as u32, &mut done, ptr::null_mut())
+                }
+            };
+            if ok == 0 {
+                return Err(Error::Win32 {
+                    call: if is_write { "WinUsb_WritePipe" } else { "WinUsb_ReadPipe" },
+                    code: last_error(),
+                });
+            }
+            return Ok(done as usize);
+        }
+
+        unsafe {
+            ResetEvent(self.event);
+            let mut ov = Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                h_event: self.event,
+            };
+            let ovp = &mut ov as *mut Overlapped as *mut c_void;
+            let ok = if is_write {
+                WinUsb_WritePipe(self.iface, self.ep_out, buf.as_ptr(), buf.len() as u32, &mut done, ovp)
+            } else {
+                WinUsb_ReadPipe(self.iface, self.ep_in, buf.as_mut_ptr(), buf.len() as u32, &mut done, ovp)
+            };
+            if ok == 0 && last_error() != ERROR_IO_PENDING {
+                return Err(Error::Win32 {
+                    call: if is_write { "WinUsb_WritePipe" } else { "WinUsb_ReadPipe" },
+                    code: last_error(),
+                });
+            }
+            match WaitForSingleObject(self.event, 2000) {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => return Err(Error::Timeout("winusb transfer")),
+                _ => return Err(Error::Win32 { call: "WaitForSingleObject", code: last_error() }),
+            }
+            let mut n = 0u32;
+            if GetOverlappedResult(self.device, &mut ov, &mut n, 0) == 0 {
+                return Err(Error::Win32 { call: "GetOverlappedResult", code: last_error() });
+            }
+            Ok(n as usize)
         }
     }
 }
 
 impl Transport for WinUsbTransport {
     fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let mut done = 0u32;
-        let ok = unsafe {
-            WinUsb_WritePipe(
-                self.iface,
-                self.ep_out,
-                buf.as_ptr(),
-                buf.len() as u32,
-                &mut done,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(Error::Win32 { call: "WinUsb_WritePipe", code: last_error() });
-        }
-        if done as usize != buf.len() {
-            return Err(Error::Protocol(format!("short write {done}/{}", buf.len())));
+        let mut tmp = buf.to_vec();
+        let n = self.transfer(true, &mut tmp)?;
+        if n != buf.len() {
+            return Err(Error::Protocol(format!("short write {n}/{}", buf.len())));
         }
         Ok(())
     }
 
     fn read(&mut self, len: usize) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; len];
-        let mut done = 0u32;
-        let ok = unsafe {
-            WinUsb_ReadPipe(
-                self.iface,
-                self.ep_in,
-                out.as_mut_ptr(),
-                out.len() as u32,
-                &mut done,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(Error::Win32 { call: "WinUsb_ReadPipe", code: last_error() });
+        // Bulk transfers can come back in pieces; keep pulling until the
+        // requested amount is here. A short answer is a protocol error, not a
+        // reason to desynchronise the command stream silently.
+        let mut out: Vec<u8> = Vec::with_capacity(len);
+        while out.len() < len {
+            let mut chunk = vec![0u8; len - out.len()];
+            match self.transfer(false, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e) => {
+                    return Err(Error::Protocol(format!(
+                        "short read {}/{} after {e}",
+                        out.len(),
+                        len
+                    )))
+                }
+            }
         }
-        if done as usize != len {
-            return Err(Error::Protocol(format!("short read {done}/{len}")));
+        if out.len() != len {
+            return Err(Error::Protocol(format!("short read {}/{len}", out.len())));
         }
         Ok(out)
     }
 
     fn describe(&self) -> String {
-        format!("{} (bulk out {:#04x}, in {:#04x})", self.path, self.ep_out, self.ep_in)
+        format!(
+            "{} (bulk out {:#04x}, in {:#04x}{})",
+            self.path,
+            self.ep_out,
+            self.ep_in,
+            if self.overlapped { ", overlapped" } else { "" }
+        )
+    }
+
+    fn drain(&mut self, max: usize, timeout_ms: u64) -> Result<Vec<u8>> {
+        self.read_available(max, timeout_ms)
     }
 }
 
@@ -374,6 +544,9 @@ impl Drop for WinUsbTransport {
         unsafe {
             if !self.iface.is_null() {
                 WinUsb_Free(self.iface);
+            }
+            if !self.event.is_null() {
+                CloseHandle(self.event);
             }
             if !self.device.is_null() && self.device != (-1isize) as Handle {
                 CloseHandle(self.device);

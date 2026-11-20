@@ -22,6 +22,14 @@ pub trait Transport: Send {
     fn write(&mut self, buf: &[u8]) -> Result<()>;
     /// Read exactly `len` bytes of response.
     fn read(&mut self, len: usize) -> Result<Vec<u8>>;
+    /// Read whatever is available within `timeout_ms`, up to `max` bytes.
+    ///
+    /// Some commands (the calibration dumps) answer with a device-specific
+    /// number of bytes, so the only safe way to consume them is to drain until
+    /// the device goes quiet.
+    fn drain(&mut self, _max: usize, _timeout_ms: u64) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
     /// Human readable identity of the link, for logs and the UI.
     fn describe(&self) -> String;
 }

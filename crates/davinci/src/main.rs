@@ -20,6 +20,8 @@ fn main() {
         "info" => info(),
         "capture" => capture(&args[1..]),
         "zero" => zero(&args[1..]),
+        "raw" => raw(&args[1..]),
+        "dump" => dump(&args[1..]),
         "serve" => serve(&args[1..]),
         #[cfg(windows)]
         "paths" => {
@@ -292,4 +294,94 @@ fn serve(args: &[String]) -> i32 {
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Send raw command frames and print exactly what comes back.
+///
+/// Each argument is `hex:readlen`, for example `B0:1`, `B5:1` or
+/// `B9 01 BF 04 00 00:1`. A `~` prefix means "sleep 100 ms first".
+fn raw(args: &[String]) -> i32 {
+    let mut io = match hantek1008::transport::open_default() {
+        Ok(io) => io,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    println!("{}", io.describe());
+    for spec in args {
+        let (hex, len) = match spec.rsplit_once(':') {
+            Some((h, l)) => (h, l.parse::<usize>().unwrap_or(1)),
+            None => (spec.as_str(), 1),
+        };
+        if let Some(rest) = hex.strip_prefix('~') {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            return raw_one(&mut io, rest, len);
+        }
+        if raw_one(&mut io, hex, len) != 0 {
+            return 1;
+        }
+    }
+    0
+}
+
+fn dump(args: &[String]) -> i32 {
+    let mut io = match hantek1008::transport::open_default() {
+        Ok(io) => io,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    println!("{}", io.describe());
+    for spec in args {
+        let clean: String = spec.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let bytes: Vec<u8> = (0..clean.len() / 2)
+            .map(|i| u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).unwrap_or(0))
+            .collect();
+        let shown: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        print!("> {:<28}", shown.join(" "));
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        if let Err(e) = io.write(&bytes) {
+            println!("write err: {e}");
+            return 1;
+        }
+        match io.drain(512, 150) {
+            Ok(r) => {
+                let got: Vec<String> = r.iter().take(16).map(|b| format!("{b:02X}")).collect();
+                let tail = if r.len() > 16 { format!(" … ({}) ", r.len()) } else { String::new() };
+                println!("{:>3} Б: {}{}", r.len(), got.join(" "), tail);
+            }
+            Err(e) => {
+                println!("drain err: {e}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+fn raw_one(io: &mut Box<dyn hantek1008::transport::Transport>, hex: &str, len: usize) -> i32 {
+    let clean: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let bytes: Vec<u8> = (0..clean.len() / 2)
+        .map(|i| u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).unwrap_or(0))
+        .collect();
+    let shown: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    print!("> {} : ", shown.join(" "));
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    if let Err(e) = io.write(&bytes) {
+        println!("write err: {e}");
+        return 1;
+    }
+    match io.read(len) {
+        Ok(r) => {
+            let got: Vec<String> = r.iter().map(|b| format!("{b:02X}")).collect();
+            println!("{}", got.join(" "));
+            0
+        }
+        Err(e) => {
+            println!("read err: {e}");
+            1
+        }
+    }
 }

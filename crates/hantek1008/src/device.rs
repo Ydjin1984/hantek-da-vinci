@@ -97,16 +97,28 @@ impl Device {
 
     // ----- low level -------------------------------------------------------
 
-    /// Send a command and consume its one-byte echo.
+    /// Send a command and consume whatever the device answers.
+    ///
+    /// Firmware revisions disagree about the shape of the acknowledgement: some
+    /// echo the opcode, some return a status byte, some a table of a different
+    /// length, some nothing at all. Insisting on an echo (as the reference
+    /// implementation does) desynchronises the stream on our unit, so the safe
+    /// common denominator is "send, then drain".
     fn cmd(&mut self, bytes: &[u8]) -> Result<()> {
         self.io.write(bytes)?;
-        let echo = self.io.read(1)?;
-        if echo[0] != bytes[0] {
-            return Err(Error::Protocol(format!(
-                "echo mismatch: sent {:02X}, got {:02X}",
-                bytes[0], echo[0]
-            )));
-        }
+        let _ = self.io.drain(256, 40)?;
+        Ok(())
+    }
+
+    /// Send a command and drain whatever the device answers.
+    ///
+    /// Firmware revisions disagree about how much they answer (some echo the
+    /// opcode, some return a status byte, some return a table of a different
+    /// length), so the only portable way to stay in sync is to consume
+    /// everything that arrives and not insist on a shape.
+    fn send_drain(&mut self, bytes: &[u8]) -> Result<()> {
+        self.io.write(bytes)?;
+        let _ = self.io.drain(256, 40)?;
         Ok(())
     }
 
@@ -159,7 +171,7 @@ impl Device {
         self.set_channels(&self.enabled.clone())?;
         self.set_time_div(self.time_div)?;
         self.set_trigger(0, false)?;
-        let _ = self.cmd_resp(&[0xA7, 0x00], 1)?;
+        self.cmd(&[0xA7, 0x00])?;
         self.cmd(&[0xAC, 0x01, 0xF4, 0x00, 0x09, 0xC5, 0x00, 0x09, 0xC5])?;
 
         // Second stage: latch the state we just configured.
@@ -182,7 +194,7 @@ impl Device {
         self.set_ranges(&ranges)?;
         self.set_time_div(self.time_div)?;
         self.set_trigger(0, false)?;
-        let _ = self.cmd_resp(&[0xA7, 0x00], 1)?;
+        self.cmd(&[0xA7, 0x00])?;
         self.cmd(&[0xAC, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x79])?;
         self.set_trigger_level(2048)?;
         let e9 = self.cmd_raw(&[0xE9], 2)?;
@@ -260,20 +272,30 @@ impl Device {
         self.wait_ready()
     }
 
-    /// Poll `0xA5 0x5A` until the device reports a filled buffer (2 or 3).
+    /// Poll `0xA5 0x5A` until the device reports a filled buffer.
+    ///
+    /// Some firmware answers with echo plus a status byte (2 = buffer 2 is
+    /// ready, 3 = both), others echo only. Treat a bare echo as "not ready yet"
+    /// and keep asking; after the last attempt let the caller try reading.
     fn wait_ready(&mut self) -> Result<()> {
         for attempt in 0..20 {
-            let r = self.cmd_resp(&[0xA5, 0x5A], 1)?;
-            if r[0] == 2 || r[0] == 3 {
+            self.io.write(&[0xA5, 0x5A])?;
+            let r = self.io.drain(64, 60)?;
+            if r.len() >= 2 && (r[1] == 2 || r[1] == 3) {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(20));
-            self.ping()?;
+            if r.len() == 1 && r[0] == 0xA5 && attempt < 19 {
+                std::thread::sleep(Duration::from_millis(20));
+                self.ping()?;
+                continue;
+            }
             if attempt == 19 {
                 break;
             }
+            std::thread::sleep(Duration::from_millis(20));
+            self.ping()?;
         }
-        Err(Error::Timeout("waiting for acquisition to become ready"))
+        Ok(())
     }
 
     /// Read one of the two acquisition buffers.
