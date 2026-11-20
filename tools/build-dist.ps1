@@ -42,7 +42,7 @@ try {
     $setup = Join-Path $root 'crates\setup\target\release\davinci-setup.exe'
 
     Copy-Item $app (Join-Path $dist 'DaVinci.exe') -Force
-    Copy-Item $setup (Join-Path $dist "DaVinci-Setup-$version.exe") -Force
+    Copy-Item $setup (Join-Path $dist "DaVinci-Setup.exe") -Force
 
     Write-Host ''
     Write-Host '== готово ==' -ForegroundColor Green
@@ -51,7 +51,7 @@ try {
     }
     Write-Host ''
     Write-Host 'Проверка без установки:  dist\DaVinci.exe --sim --no-open'
-    Write-Host 'Установка:               dist\DaVinci-Setup-0.1.0.exe'
+    Write-Host 'Установка:               dist\DaVinci-Setup.exe'
 }
 finally {
     Pop-Location

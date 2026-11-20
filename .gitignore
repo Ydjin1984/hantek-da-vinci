@@ -3,9 +3,12 @@
 /crates/setup/target
 **/*.rs.bk
 /ui/node_modules
-# Готовые к раздаче файлы: их собирает tools/build-dist.ps1, в репозитории
-# им не место — иначе каждая сборка давала бы бинарный diff на мегабайт.
-/dist
+# Готовые файлы для скачивания лежат в dist и собираются tools/build-dist.ps1.
+# Держим их в репозитории намеренно: иначе установщик некуда взять без сборки.
+/dist/*
+!/dist/DaVinci.exe
+!/dist/DaVinci-Setup.exe
+!/dist/README.md
 /logs
 *.log
 *.err
