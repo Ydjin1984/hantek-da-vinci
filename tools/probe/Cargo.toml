@@ -1,0 +1,8 @@
+[package]
+name = "dso-probe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dso-probe"
+path = "src/main.rs"

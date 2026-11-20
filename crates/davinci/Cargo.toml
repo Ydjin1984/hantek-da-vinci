@@ -1,0 +1,16 @@
+[package]
+name = "davinci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Осциллограф Хелтег да Винчи — daemon, CLI and logging for the Hantek 1008C"
+
+[[bin]]
+name = "davinci"
+path = "src/main.rs"
+
+[dependencies]
+hantek1008 = { path = "../hantek1008" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"

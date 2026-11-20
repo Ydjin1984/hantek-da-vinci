@@ -1,0 +1,16 @@
+[package]
+name = "hantek1008"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hantek 1008C protocol, transport and calibration"
+
+[features]
+default = []
+# Direct access to Hantek's kernel driver. Known to bugcheck (0x3B) on the
+# hardware this was developed on — see src/transport/vendor.rs first.
+vendor-driver = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
