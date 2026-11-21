@@ -21,6 +21,51 @@ use hantek1008::CHANNELS;
 /// filled band and its frequency reading means nothing.
 pub const MIN_POINTS_PER_PERIOD: f64 = 4.0;
 
+/// Share of sample pairs that may jump by more than half the swing before the
+/// trace is called undersampled.
+///
+/// A square wave with six real points per period jumps twice in six (0,33); an
+/// aliased bus jumps on two samples out of three (0,67). A sine is smoother than
+/// either. 0,5 sits in the gap, not on an edge.
+pub const JUMP_FRACTION_LIMIT: f64 = 0.5;
+
+/// Share of neighbouring samples whose difference exceeds half the swing.
+fn jump_fraction(samples: &[f32]) -> f64 {
+    if samples.len() < 3 {
+        return 0.0;
+    }
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &v in samples {
+        if !v.is_finite() {
+            continue;
+        }
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let swing = hi - lo;
+    if !(swing > 0.0) {
+        return 0.0;
+    }
+    let limit = swing * 0.5;
+    let mut jumps = 0usize;
+    let mut pairs = 0usize;
+    for w in samples.windows(2) {
+        if !(w[0].is_finite() && w[1].is_finite()) {
+            continue;
+        }
+        pairs += 1;
+        if (w[1] - w[0]).abs() > limit {
+            jumps += 1;
+        }
+    }
+    if pairs == 0 {
+        0.0
+    } else {
+        jumps as f64 / pairs as f64
+    }
+}
+
 /// One sweep, selected by the trigger and measured on its own samples.
 #[derive(Debug)]
 pub struct Snapshot {
@@ -150,14 +195,20 @@ impl Snapshot {
             .enumerate()
             .map(|(k, &ch)| {
                 let m = self.stats.get(k).copied().unwrap_or_default();
-                // Samples the frame actually has per period of what it measured.
-                // Below a handful the picture is an alias, not a waveform: the
-                // reading is arithmetic on unrelated points and must not be shown
-                // as if the trace matched it.
                 let points_per_period = m
                     .freq
                     .filter(|f| f.is_finite() && *f > 0.0)
                     .map(|f| 1.0 / (f as f64 * self.dt_s.max(f64::MIN_POSITIVE)));
+                // Points per period is measured against the frequency the frame
+                // *reports*, and an alias reports a low one: a 15,8 kHz bus seen
+                // at 20 kHz "measures" 3,3 kHz and looks like six points per
+                // period. A signal that cannot be sampled properly also jumps
+                // between the rails on most sample pairs, which a waveform with
+                // six real points per period does not do (a square wave has two
+                // jumps in six, a sine none).
+                let jump_fraction = self.samples.get(k).map(|s| jump_fraction(s)).unwrap_or(0.0);
+                let too_few = points_per_period.is_some_and(|p| p < MIN_POINTS_PER_PERIOD);
+                let jumping = m.freq.is_some() && jump_fraction > JUMP_FRACTION_LIMIT;
                 serde_json::json!({
                     "ch": ch,
                     "vmin": finite(m.vmin),
@@ -170,7 +221,15 @@ impl Snapshot {
                     "duty": m.duty.filter(|d| d.is_finite()),
                     "period_s": m.period_s.filter(|p| p.is_finite()),
                     "points_per_period": points_per_period,
-                    "aliased": points_per_period.is_some_and(|p| p < MIN_POINTS_PER_PERIOD),
+                    "jump_fraction": jump_fraction,
+                    "aliased": too_few || jumping,
+                    "alias_reason": if too_few {
+                        Some("points")
+                    } else if jumping {
+                        Some("jumps")
+                    } else {
+                        None
+                    },
                     "n": self.samples.get(k).map(|s| s.len()).unwrap_or(0),
                     "window_s": self.window_s(),
                 })
@@ -459,6 +518,37 @@ mod tests {
         let meta = snap.meta_json(800, false, "captured", true);
         assert_eq!(meta["stats"][0]["aliased"], false);
         assert!(meta["stats"][0]["points_per_period"].is_null());
+    }
+
+    #[test]
+    fn an_alias_that_measures_a_plausible_frequency_is_still_an_alias() {
+        // A 15,8 kHz bus at 20 kHz sampling: the frame "measures" 3,3 kHz, i.e.
+        // six points per period, so the points test alone would pass it. The
+        // samples, however, leap between the rails on most pairs.
+        let mut snap = snapshot(vec![0], vec![vec![0.0; 4000]], 3999.0);
+        snap.dt_s = 1.0 / 20_000.0;
+        let rails: Vec<f32> = (0..1000).map(|i| if i % 3 == 0 { 0.2 } else { 2.5 }).collect();
+        snap.samples = vec![rails];
+        snap.stats = vec![Measure { freq: Some(3333.0), ..Measure::default() }];
+        let meta = snap.meta_json(800, false, "captured", true);
+        assert_eq!(meta["stats"][0]["aliased"], true);
+        assert_eq!(meta["stats"][0]["alias_reason"], "jumps");
+        let jumps = meta["stats"][0]["jump_fraction"].as_f64().expect("jumps");
+        assert!(jumps > 0.5, "jump fraction {jumps}");
+
+        // A square wave with six real points per period jumps twice in six.
+        let square: Vec<f32> = (0..1000).map(|i| if (i % 6) < 3 { 0.2 } else { 2.5 }).collect();
+        snap.samples = vec![square];
+        let meta = snap.meta_json(800, false, "captured", true);
+        assert_eq!(meta["stats"][0]["aliased"], false, "a real square must not be flagged");
+
+        // A sine at six points per period is smoother still.
+        let sine: Vec<f32> = (0..1000)
+            .map(|i| 1.35 + 1.15 * ((i as f32) * 6.2832 / 6.0).sin())
+            .collect();
+        snap.samples = vec![sine];
+        let meta = snap.meta_json(800, false, "captured", true);
+        assert_eq!(meta["stats"][0]["aliased"], false);
     }
 
     #[test]

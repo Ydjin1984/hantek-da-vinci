@@ -252,19 +252,33 @@ try {
 
   // --- Cursors in engineering units: drag A to 20 % and B to 40 % of a 20 ms
   // window and the readout must say 4 ms / 250 Hz.
+  // Placed by keyboard, not by a pixel drag: 50 steps left put A on the left edge
+  // and 40 steps right put B on 40 % of the window, whatever the layout is. A
+  // pointer drag lands wherever the lanes happen to be, and the number under test
+  // here is the conversion into milliseconds, not the gesture (that one is checked
+  // by the drag test above).
   const plot = await evaluate(`(() => { const r = document.getElementById('plot').getBoundingClientRect();
     return { left: r.left + 88, right: r.left + r.width - 42, top: r.top, height: r.height }; })()`);
   const pw = plot.right - plot.left;
-  const yTime = plot.top + plot.height * 0.3;
-  await drag({ x: plot.left + pw * 0.2, y: yTime }, { x: plot.left + pw * 0.2, y: yTime }, 2);
-  await drag({ x: plot.left + pw * 0.8, y: yTime }, { x: plot.left + pw * 0.4, y: yTime }, 6);
+  // The arrow keys are handled by the canvas, so the events go there and it gets
+  // the focus first — dispatching on window proves nothing.
+  const key = `(() => {
+    const cv = document.getElementById('plot');
+    cv.focus();
+    const send = (k) => cv.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
+    send('a'); for (let i = 0; i < 60; i++) send('ArrowLeft');
+    send('b'); for (let i = 0; i < 60; i++) send('ArrowLeft');
+    for (let i = 0; i < 40; i++) send('ArrowRight');
+  })()`;
+  await evaluate(key);
+  await sleep(400);
   const cur = await evaluate(`document.getElementById('readout').textContent`);
   const dtMatch = /Δt\s*([\d.,]+)\s*мкс|Δt\s*([\d.,]+)\s*мс/.exec(cur);
   const dtMs = dtMatch ? Number((dtMatch[2] ?? dtMatch[1]).replace(",", ".")) / (dtMatch[2] ? 1 : 1000) : NaN;
   const freqMatch = /1\/\|Δt\|\s*([\d.,]+)\s*Гц|1\/\|Δt\|\s*([\d.,]+)\s*кГц/.exec(cur);
   const freq = freqMatch ? Number((freqMatch[2] ?? freqMatch[1]).replace(",", ".")) * (freqMatch[2] ? 1000 : 1) : NaN;
   const windowMs = (await capture()).window_s * 1000;
-  const expectedDt = 0.2 * windowMs;
+  const expectedDt = 0.4 * windowMs;
   record(
     "курсоры показывают Δt в единицах кадра",
     Math.abs(dtMs - expectedDt) < Math.max(0.15, windowMs * 0.03),
@@ -355,8 +369,14 @@ try {
     const l = document.getElementById('trig-level'); l.value = '999';
     l.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
-  await sleep(900);
-  const statusText = await evaluate(`document.getElementById('status').textContent`);
+  // The status line keeps the error for one poll and then goes back to the live
+  // numbers, so look for it for a while instead of at one instant.
+  let statusText = "";
+  for (let i = 0; i < 20; i++) {
+    await sleep(100);
+    statusText = await evaluate(`document.getElementById('status').textContent`);
+    if (/ошибка/i.test(statusText)) break;
+  }
   record("ошибка команды видна в статусе", /ошибка/i.test(statusText), statusText.slice(0, 120));
 
   await shot("ui-6-final");

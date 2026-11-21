@@ -76,8 +76,12 @@ interface Stat {
   period_s: number | null;
   /** Samples the frame has per period of the frequency it measured. */
   points_per_period: number | null;
-  /** True when that is too few to draw the waveform: the trace is an alias. */
+  /** Share of sample pairs that leap more than half the swing. */
+  jump_fraction: number;
+  /** True when the trace cannot be the waveform: it is an alias of one. */
   aliased: boolean;
+  /** Which test caught it: too few points, or samples leaping between the rails. */
+  alias_reason: "points" | "jumps" | null;
   n: number;
   window_s: number;
 }
@@ -929,9 +933,11 @@ function paintCards(cap: Capture): void {
       sat.textContent = meta?.saturated ? "АЦП на пределе" : "";
       const alias = card.metrics["alias"];
       alias.hidden = !stat.aliased;
-      alias.textContent = stat.aliased
-        ? `мало точек: ${fmt(stat.points_per_period, 1)} отсчёта на период — нужна развёртка быстрее`
-        : "";
+      alias.textContent = !stat.aliased
+        ? ""
+        : stat.alias_reason === "jumps"
+          ? "сигнал скачет между отсчётами — он быстрее развёртки"
+          : `мало точек: ${fmt(stat.points_per_period, 1)} отсчёта на период — нужна развёртка быстрее`;
     } else {
       for (const key of ["vmin", "vmax", "vpp", "rms", "rms_ac", "freq", "duty", "period"]) {
         set(key, "—");
