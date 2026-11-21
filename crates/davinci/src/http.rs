@@ -126,6 +126,15 @@ fn handle(mut request: Request, assets: &Assets, eng: &EngineHandle) -> std::io:
                 "held": st.held,
                 "rec": st.rec,
                 "trigger": serde_json::to_value(&st.trigger).unwrap_or(serde_json::Value::Null),
+                "source_span": st.source_span.map(|(lo, hi)| serde_json::json!([lo, hi])),
+                "level_rescue": st.level_rescue.map(|r| {
+                    serde_json::json!({
+                        "min_v": r.min_v,
+                        "max_v": r.max_v,
+                        "level_v": r.level_v,
+                        "age_ms": r.age_ms,
+                    })
+                }),
                 "log": {
                     "path": st.log_path,
                     "bytes": st.log_bytes,

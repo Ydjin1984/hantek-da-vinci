@@ -20,6 +20,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// How much history the live view can look back at.
 const HISTORY_SECONDS: f64 = 5.0;
 
+/// How long a level may sit outside the signal before the engine moves it.
+///
+/// One block is 1–60 ms, so this is several blocks of evidence: long enough that
+/// noise or a single off-screen excursion does not move the level, short enough
+/// that the picture is never visibly stuck.
+const LEVEL_RESCUE_MS: u64 = 400;
+
+/// After the user sets the level, the rescue keeps its hands off for this long.
+const LEVEL_USER_GRACE_MS: u64 = 2500;
+
 /// Live parameters, changed from the UI while acquisition runs.
 #[derive(Debug, Clone)]
 pub struct Params {
@@ -107,6 +117,22 @@ pub struct Status {
     pub rec: bool,
     /// Trigger settings in force.
     pub trigger: TriggerConfig,
+    /// Smallest and largest value of the trigger source in the most recent block,
+    /// in volts. The UI prints them next to the level so a level that the signal
+    /// cannot reach is visible before it costs a minute of a frozen screen.
+    pub source_span: Option<(f32, f32)>,
+    /// Set for a while after the engine moved a level no edge could ever reach.
+    pub level_rescue: Option<LevelRescueInfo>,
+}
+
+/// What the engine did, and what it saw, when it had to move an unreachable level.
+#[derive(Debug, Clone, Copy)]
+pub struct LevelRescueInfo {
+    pub min_v: f32,
+    pub max_v: f32,
+    pub level_v: f32,
+    /// Milliseconds since the move, so an old note fades out of the panel.
+    pub age_ms: u64,
 }
 
 struct Inner {
@@ -141,6 +167,24 @@ struct Inner {
     /// Bumped on every arm, so a block read started before the arm cannot
     /// satisfy it.
     arm_seq: u64,
+    /// When the level was first seen outside the source's own range.
+    level_outside_since: Option<Instant>,
+    /// When the user last typed or dragged the level, which grants it a grace
+    /// period the rescue must not shorten.
+    level_set_at: Option<Instant>,
+    /// The last time the engine had to move an unreachable level.
+    level_rescue: Option<LevelRescue>,
+    /// Extremes of the trigger source in the latest block, in volts.
+    source_span: Option<(f32, f32)>,
+}
+
+/// A trace the engine wrote when it moved a level the signal could not reach.
+#[derive(Debug, Clone, Copy)]
+struct LevelRescue {
+    min_v: f32,
+    max_v: f32,
+    level_v: f32,
+    at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +261,10 @@ impl Engine {
                 armed: false,
                 single_done: false,
                 arm_seq: 0,
+                level_outside_since: None,
+                level_set_at: None,
+                level_rescue: None,
+                source_span: None,
             })),
             running: Arc::new(AtomicBool::new(true)),
             reset_peaks: Arc::new(AtomicBool::new(false)),
@@ -253,6 +301,10 @@ impl Engine {
                 armed: false,
                 single_done: false,
                 arm_seq: 0,
+                level_outside_since: None,
+                level_set_at: None,
+                level_rescue: None,
+                source_span: None,
             })),
             running: Arc::new(AtomicBool::new(false)),
             reset_peaks: Arc::new(AtomicBool::new(false)),
@@ -466,6 +518,16 @@ impl EngineHandle {
             ));
         }
         let mode_changed = g.params.trigger.mode != cfg.mode;
+        // A level the user typed is theirs for a moment: the rescue below must not
+        // move it out from under the keyboard before they finish.
+        if (g.params.trigger.level_v - cfg.level_v).abs() > f32::EPSILON
+            || (g.params.trigger.source != cfg.source)
+            || (g.params.trigger.edge != cfg.edge)
+        {
+            g.level_set_at = Some(Instant::now());
+            g.level_outside_since = None;
+            g.level_rescue = None;
+        }
         g.params.trigger = cfg;
         if mode_changed {
             g.armed = false;
@@ -653,6 +715,18 @@ impl EngineHandle {
             held: g.held.is_some(),
             rec: g.log.is_some(),
             trigger: g.params.trigger.clone(),
+            source_span: g.source_span,
+            level_rescue: g
+                .level_rescue
+                .map(|r| LevelRescueInfo {
+                    min_v: r.min_v,
+                    max_v: r.max_v,
+                    level_v: r.level_v,
+                    age_ms: r.at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                })
+                // An old move is history, not a message: the panel must not keep
+                // explaining something that happened a minute ago.
+                .filter(|r| r.age_ms < 15_000),
             log_path: g.log.as_ref().map(|l| l.path.display().to_string()),
             log_bytes: g.log.as_ref().map(|l| l.bytes).unwrap_or(0),
             log_seconds: g.log.as_ref().map(|l| l.started_at.elapsed().as_secs_f64()).unwrap_or(0.0),
@@ -923,6 +997,31 @@ fn to_mv(v: f32) -> i16 {
     (v * 1000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
+/// Smallest and largest finite value of a block, ignoring NaN.
+///
+/// Both ends at 0 when nothing finite was seen, which makes "the input is not
+/// moving" the same answer for an empty block and for a flat one.
+fn extremes(v: &[f32]) -> (f32, f32) {
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &x in v {
+        if !x.is_finite() {
+            continue;
+        }
+        if x < lo {
+            lo = x;
+        }
+        if x > hi {
+            hi = x;
+        }
+    }
+    if lo > hi {
+        (0.0, 0.0)
+    } else {
+        (lo, hi)
+    }
+}
+
 /// Middle value of a set, or `None` when it is empty.
 ///
 /// Used to combine a measurement taken from each acquisition: one bad block
@@ -1015,7 +1114,7 @@ fn ingest(
     }
 
     let block = g.history.back().expect("just pushed").clone();
-    let cfg = pinned.trigger.clone();
+    let mut cfg = pinned.trigger.clone();
     let mode = cfg.mode;
 
     // Single-shot only captures for the arm that is current *now*: a block whose
@@ -1042,6 +1141,52 @@ fn ingest(
     });
 
     let hysteresis = cfg.hysteresis(pinned.ranges[cfg.source].resolution());
+
+    // A level the signal cannot reach produces no edge, and Normal would then sit
+    // on a frozen picture for ever — which reads as a hung program, not as an
+    // instrument that is waiting. After a moment of watching, move the level to the
+    // middle of what the input actually shows, and say so. A level inside the
+    // signal is never touched: only a level that no edge could ever cross is moved,
+    // and a level the user has just typed is left alone for a couple of seconds so
+    // the rescue cannot fight the keyboard.
+    if let Some(s) = source_volts.as_deref() {
+        let (lo, hi) = extremes(s);
+        g.source_span = Some((lo, hi));
+        let moving = hi - lo > hysteresis;
+        if mode != trigger::Mode::Free && moving {
+            // A rising edge needs a sample below `low` before one above `high`;
+            // when the whole block sits on one side of that band, no edge can
+            // ever appear. Comparing against the band, not the bare level,
+            // matters: a level 10 mV under a bus that never reaches 0 V is
+            // "outside the signal" yet well inside one hysteresis.
+            let low = cfg.level_v - hysteresis * 0.5;
+            let high = cfg.level_v + hysteresis * 0.5;
+            let unreachable = hi < high || lo > low;
+            if unreachable {
+                let since = *g.level_outside_since.get_or_insert_with(Instant::now);
+                let user_recent = g
+                    .level_set_at
+                    .is_some_and(|t| t.elapsed().as_millis() < LEVEL_USER_GRACE_MS as u128);
+                if since.elapsed().as_millis() >= LEVEL_RESCUE_MS as u128 && !user_recent {
+                    let limit = pinned.ranges[cfg.source].full_scale();
+                    let level = ((lo + hi) / 2.0).clamp(-limit, limit);
+                    cfg.level_v = level;
+                    g.params.trigger.level_v = level;
+                    g.level_rescue = Some(LevelRescue {
+                        min_v: lo,
+                        max_v: hi,
+                        level_v: level,
+                        at: Instant::now(),
+                    });
+                    g.level_outside_since = None;
+                }
+            } else {
+                g.level_outside_since = None;
+            }
+        } else {
+            g.level_outside_since = None;
+        }
+    }
     let found = if mode == trigger::Mode::Free {
         None
     } else {
@@ -1236,6 +1381,10 @@ mod tests {
             armed: false,
             single_done: false,
             arm_seq: 0,
+            level_outside_since: None,
+            level_set_at: None,
+            level_rescue: None,
+            source_span: None,
         }
     }
 
@@ -1293,6 +1442,100 @@ mod tests {
         run(&mut g, cfg, &sine(1000, 125.0, 1.0, 0.0, 50_000.0), 0);
         assert!(g.last.is_none(), "nothing may be published without an edge");
         assert_eq!(g.state, CaptureState::Waiting);
+    }
+
+    /// A bus that sits between 0.2 and 2.6 V — the shape that froze the screen:
+    /// every sample above the level, so a rising edge can never exist.
+    fn bus() -> Vec<f32> {
+        (0..1000)
+            .map(|i| if (i % 200) < 100 { 0.2 } else { 2.6 })
+            .collect()
+    }
+
+    #[test]
+    fn an_unreachable_level_is_moved_to_the_middle_of_the_signal() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Normal;
+        cfg.level_v = -2.0;
+        // The level has already been watched for longer than the rescue waits.
+        g.level_outside_since = Some(Instant::now() - Duration::from_millis(LEVEL_RESCUE_MS + 50));
+        run(&mut g, cfg, &bus(), 0);
+        let level = g.params.trigger.level_v;
+        assert!((level - 1.4).abs() < 0.05, "level {level}");
+        assert!(g.last.is_some(), "the moved level must fire on this very block");
+        assert_eq!(g.state, CaptureState::Captured);
+        let note = g.level_rescue.expect("the panel has to explain the move");
+        assert!(note.level_v > 1.0 && note.level_v < 1.8, "note {note:?}");
+        assert!(note.min_v < 0.25 && note.max_v > 2.5, "note {note:?}");
+    }
+
+    #[test]
+    fn a_level_just_below_the_noise_floor_is_still_unreachable() {
+        // The bus turns between 10 mV and 2 V, the level is 0 V: 10 mV away, i.e.
+        // inside one hysteresis. A naive "level outside min..max" test calls this
+        // reachable and leaves the screen frozen — which is exactly how it froze
+        // in the field.
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Normal;
+        cfg.level_v = 0.0;
+        g.level_outside_since = Some(Instant::now() - Duration::from_millis(LEVEL_RESCUE_MS + 50));
+        let signal: Vec<f32> = (0..1000)
+            .map(|i| if (i % 200) < 100 { 0.01 } else { 2.0 })
+            .collect();
+        run(&mut g, cfg, &signal, 0);
+        assert!(g.level_rescue.is_some(), "the level had to move");
+        assert!((g.params.trigger.level_v - 1.0).abs() < 0.1);
+        assert!(g.last.is_some(), "and it must trigger on the same block");
+    }
+
+    #[test]
+    fn a_level_inside_the_signal_is_never_moved() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Normal;
+        cfg.level_v = 1.0;
+        g.level_outside_since = Some(Instant::now() - Duration::from_millis(LEVEL_RESCUE_MS * 4));
+        run(&mut g, cfg, &bus(), 0);
+        assert!((g.params.trigger.level_v - 1.0).abs() < 1e-6);
+        assert!(g.level_rescue.is_none());
+        assert!(g.last.is_some(), "a reachable level triggers normally");
+    }
+
+    #[test]
+    fn a_level_the_user_just_set_gets_its_grace_before_the_rescue() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Normal;
+        cfg.level_v = -2.0;
+        g.level_set_at = Some(Instant::now());
+        g.level_outside_since = Some(Instant::now() - Duration::from_millis(LEVEL_RESCUE_MS * 4));
+        run(&mut g, cfg, &bus(), 0);
+        assert!((g.params.trigger.level_v + 2.0).abs() < 1e-6, "the rescue fought the keyboard");
+        assert!(g.level_rescue.is_none());
+    }
+
+    #[test]
+    fn a_flat_input_is_not_rescued_onto_itself() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Normal;
+        cfg.level_v = 5.0;
+        g.level_outside_since = Some(Instant::now() - Duration::from_millis(LEVEL_RESCUE_MS * 4));
+        run(&mut g, cfg, &vec![0.3f32; 1000], 0);
+        // Nothing moves: there is no signal to centre on, and pretending there is
+        // would be worse than waiting.
+        assert!((g.params.trigger.level_v - 5.0).abs() < 1e-6);
+        assert!(g.level_rescue.is_none());
+        let (lo, hi) = g.source_span.expect("the panel still needs the range");
+        assert!((hi - lo).abs() < 0.05, "span {lo}..{hi}");
+    }
+
+    #[test]
+    fn extremes_ignores_nan_and_empty_blocks() {
+        assert_eq!(extremes(&[]), (0.0, 0.0));
+        assert_eq!(extremes(&[f32::NAN, 1.0, -2.0]), (-2.0, 1.0));
     }
 
     #[test]

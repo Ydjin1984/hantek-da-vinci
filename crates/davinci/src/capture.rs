@@ -15,6 +15,12 @@ use crate::trigger::Config;
 use hantek1008::protocol::Measure;
 use hantek1008::CHANNELS;
 
+/// Fewer samples than this per period of the measured signal and the trace on
+/// screen is an alias of the waveform, not the waveform. Four is the usual
+/// "barely enough to see the shape" line: below it a square wave turns into a
+/// filled band and its frequency reading means nothing.
+pub const MIN_POINTS_PER_PERIOD: f64 = 4.0;
+
 /// One sweep, selected by the trigger and measured on its own samples.
 #[derive(Debug)]
 pub struct Snapshot {
@@ -144,6 +150,14 @@ impl Snapshot {
             .enumerate()
             .map(|(k, &ch)| {
                 let m = self.stats.get(k).copied().unwrap_or_default();
+                // Samples the frame actually has per period of what it measured.
+                // Below a handful the picture is an alias, not a waveform: the
+                // reading is arithmetic on unrelated points and must not be shown
+                // as if the trace matched it.
+                let points_per_period = m
+                    .freq
+                    .filter(|f| f.is_finite() && *f > 0.0)
+                    .map(|f| 1.0 / (f as f64 * self.dt_s.max(f64::MIN_POSITIVE)));
                 serde_json::json!({
                     "ch": ch,
                     "vmin": finite(m.vmin),
@@ -155,6 +169,8 @@ impl Snapshot {
                     "freq": m.freq.filter(|f| f.is_finite()),
                     "duty": m.duty.filter(|d| d.is_finite()),
                     "period_s": m.period_s.filter(|p| p.is_finite()),
+                    "points_per_period": points_per_period,
+                    "aliased": points_per_period.is_some_and(|p| p < MIN_POINTS_PER_PERIOD),
                     "n": self.samples.get(k).map(|s| s.len()).unwrap_or(0),
                     "window_s": self.window_s(),
                 })
@@ -419,6 +435,30 @@ mod tests {
         // len 2 samples at 20 µs, trigger at 30 % of 40 µs = 12 µs.
         assert_eq!(rows[1], "42,-0.000012000,0.000000,1.000000");
         assert!(rows[3].contains(",2.000000"), "row: {}", rows[3]);
+    }
+
+    #[test]
+    fn a_reading_with_too_few_points_per_period_is_flagged_as_an_alias() {
+        // 20 µs per sample: a 3.3 kHz reading has three points per period, which
+        // is how a 15 kHz bus looks at 10 kHz sampling — a filled band, not a
+        // waveform, and a frequency that means nothing.
+        let mut snap = snapshot(vec![0], vec![vec![0.0; 4000]], 3999.0);
+        snap.dt_s = 1.0 / 10_000.0;
+        snap.stats = vec![Measure { freq: Some(3333.0), ..Measure::default() }];
+        let meta = snap.meta_json(800, false, "captured", true);
+        let ppp = meta["stats"][0]["points_per_period"].as_f64().expect("points");
+        assert!((ppp - 3.0).abs() < 0.01, "points per period {ppp}");
+        assert_eq!(meta["stats"][0]["aliased"], true);
+
+        // 125 Hz is 400 points per period: the trace and the reading agree.
+        snap.stats = vec![Measure { freq: Some(125.0), ..Measure::default() }];
+        assert_eq!(snap.meta_json(800, false, "captured", true)["stats"][0]["aliased"], false);
+
+        // No reading at all: nothing is claimed either way.
+        snap.stats = vec![Measure::default()];
+        let meta = snap.meta_json(800, false, "captured", true);
+        assert_eq!(meta["stats"][0]["aliased"], false);
+        assert!(meta["stats"][0]["points_per_period"].is_null());
     }
 
     #[test]

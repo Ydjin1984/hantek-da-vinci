@@ -43,6 +43,10 @@ interface Info {
   held: boolean;
   rec: boolean;
   trigger: TriggerCfg;
+  /** Extremes of the trigger source in the latest block, volts. */
+  source_span: [number, number] | null;
+  /** Set for a while after the engine moved a level no edge could reach. */
+  level_rescue: { min_v: number; max_v: number; level_v: number; age_ms: number } | null;
   log: { path: string | null; bytes: number; seconds: number };
   blocks_total: number;
 }
@@ -70,6 +74,10 @@ interface Stat {
   freq: number | null;
   duty: number | null;
   period_s: number | null;
+  /** Samples the frame has per period of the frequency it measured. */
+  points_per_period: number | null;
+  /** True when that is too few to draw the waveform: the trace is an alias. */
+  aliased: boolean;
   n: number;
   window_s: number;
 }
@@ -528,9 +536,13 @@ function buildCards(): void {
     const sat = document.createElement("span");
     sat.className = "sat";
     sat.hidden = true;
-    metricsHost.append(peak, sat);
+    const alias = document.createElement("span");
+    alias.className = "alias";
+    alias.hidden = true;
+    metricsHost.append(peak, sat, alias);
     metrics["peak"] = peak;
     metrics["sat"] = sat;
+    metrics["alias"] = alias;
 
     on.addEventListener("change", () => {
       if (on.checked) ui.enabled = [...new Set([...ui.enabled, ch])].sort((a, b) => a - b);
@@ -699,7 +711,58 @@ function syncTriggerFields(): void {
     }
   }
   source.value = String(cfg.source);
-  $("trig-hint").textContent =
+  paintTriggerHint();
+}
+
+/**
+ * The one line under the trigger controls. Its job is to answer "why is nothing
+ * moving?" before the user has to ask: a level outside the signal, an input that
+ * does not change, a window the block was too short for, and then — only when
+ * none of those apply — what the selected mode is doing.
+ */
+function paintTriggerHint(): void {
+  const info = ui.info;
+  const cap = ui.cap;
+  const hint = $("trig-hint");
+  const cfg = ui.cfg;
+  if (!info || !cfg) return;
+  hint.classList.remove("warn");
+
+  const rescue = info.level_rescue;
+  if (rescue && rescue.age_ms < 8000) {
+    hint.classList.add("warn");
+    hint.textContent =
+      `Уровень был вне сигнала (${volts(rescue.min_v)}…${volts(rescue.max_v)}) — ` +
+      `поставил на середину: ${volts(rescue.level_v)}.`;
+    return;
+  }
+
+  const span = info.source_span;
+  if (span && cfg.mode !== "free") {
+    const [lo, hi] = span;
+    if (hi - lo < 0.01) {
+      hint.classList.add("warn");
+      hint.textContent = `Источник CH${cfg.source + 1} не меняется (${volts(lo)}) — фронта не будет.`;
+      return;
+    }
+    if (cfg.level_v < lo || cfg.level_v > hi) {
+      hint.classList.add("warn");
+      hint.textContent =
+        `Уровень ${volts(cfg.level_v)} вне сигнала CH${cfg.source + 1} ` +
+        `(${volts(lo)}…${volts(hi)}) — фронта не будет.`;
+      return;
+    }
+  }
+
+  if (cap && (cap.trigger.clipped_pre || cap.trigger.clipped_post)) {
+    const side = cap.trigger.clipped_pre ? "до фронта" : "после фронта";
+    hint.textContent =
+      `Блоку не хватило данных ${side}: окно ${fmt(cap.trigger.pct, 1)}% перед фронтом вместо ` +
+      `${fmt(cap.trigger.pretrigger_pct, 0)}%.`;
+    return;
+  }
+
+  hint.textContent =
     cfg.mode === "single"
       ? "Один кадр на взвод; после захвата экран держится до следующего взвода."
       : cfg.mode === "normal"
@@ -802,11 +865,6 @@ function syncControls(info: Info, cap: Capture): void {
       : `окно ${seconds(actual)} · ${timeDivLabel(info.time_div_id)}`;
 
   $("trigger-state").innerHTML = `<b>${stateLabel(info, cap)}</b>`;
-  if (cap.trigger.clipped_pre || cap.trigger.clipped_post) {
-    const side = cap.trigger.clipped_pre ? "до фронта" : "после фронта";
-    $("trig-hint").textContent =
-      `Блоку не хватило данных ${side}: окно ${fmt(cap.trigger.pct, 1)}% перед фронтом вместо ${fmt(cap.trigger.pretrigger_pct, 0)}%.`;
-  }
   syncTriggerFields();
 
   const status = $("status");
@@ -858,8 +916,10 @@ function paintCards(cap: Capture): void {
       set("vpp", volts(stat.vpp));
       set("rms", volts(stat.rms));
       set("rms_ac", volts(stat.rms_ac));
-      set("freq", hz(stat.freq));
-      set("duty", stat.duty === null ? "—" : `${fmt(stat.duty * 100, 1)} %`);
+      // A frequency read off an aliased frame is arithmetic on unrelated points.
+      // "≈" says the number is there and is not to be trusted.
+      set("freq", stat.aliased ? `≈ ${hz(stat.freq)}` : hz(stat.freq));
+      set("duty", stat.duty === null ? "—" : `${stat.aliased ? "≈ " : ""}${fmt(stat.duty * 100, 1)} %`);
       set("period", stat.period_s === null ? "—" : seconds(stat.period_s));
       const peakLow = meta?.peak_min ?? null;
       const peakHigh = meta?.peak_max ?? null;
@@ -867,12 +927,18 @@ function paintCards(cap: Capture): void {
       const sat = card.metrics["sat"];
       sat.hidden = !(meta?.saturated ?? false);
       sat.textContent = meta?.saturated ? "АЦП на пределе" : "";
+      const alias = card.metrics["alias"];
+      alias.hidden = !stat.aliased;
+      alias.textContent = stat.aliased
+        ? `мало точек: ${fmt(stat.points_per_period, 1)} отсчёта на период — нужна развёртка быстрее`
+        : "";
     } else {
       for (const key of ["vmin", "vmax", "vpp", "rms", "rms_ac", "freq", "duty", "period"]) {
         set(key, "—");
       }
       set("peak", "пики: —");
       card.metrics["sat"].hidden = true;
+      card.metrics["alias"].hidden = true;
     }
   });
 }
@@ -1062,9 +1128,14 @@ function draw(): void {
   // Trigger level and T0.
   if (cap) {
     const trig = cap.trigger;
-    const lane = layout.find((l) => l.ch === trig.source);
-    if (lane && trig.mode !== "free") {
-      const level = ui.levelPreview ?? trig.level_v;
+    // The marker is a control, so it shows the level the instrument will use on
+    // the next block. The frame's own level is only a fallback: a held or stale
+    // frame keeps the level it was captured with, and drawing that while the
+    // panel shows the current one made the two disagree on screen.
+    const shownLevel = ui.levelPreview ?? ui.cfg?.level_v ?? trig.level_v;
+    const lane = layout.find((l) => l.ch === (ui.cfg?.source ?? trig.source));
+    if (lane && (ui.cfg?.mode ?? trig.mode) !== "free") {
+      const level = shownLevel;
       const yLevel = lane.yV(level);
       const inside = yLevel >= lane.y && yLevel <= lane.y + lane.lane;
       const yy = Math.min(lane.y + lane.lane - 10, Math.max(lane.y + 10, yLevel));
@@ -1197,6 +1268,12 @@ function paintReadout(cap: Capture | null): void {
   bits.push(`<span><b>окно</b> ${seconds(cap.window_s)}</span>`);
   const dropouts = cap.channel_meta.reduce((sum, m) => sum + (m.dropouts ?? 0), 0);
   if (dropouts > 0) bits.push(`<span><b>сбоев АЦП</b> ${dropouts}</span>`);
+  const aliased = cap.stats.filter((s) => s.aliased);
+  if (aliased.length > 0) {
+    bits.push(
+      `<span class="warn"><b>мало точек</b> ${aliased.map((s) => `CH${s.ch + 1}`).join(", ")}</span>`,
+    );
+  }
   if (cap.trigger.clipped_pre || cap.trigger.clipped_post) {
     bits.push(`<span><b>T₀</b> ${fmt(cap.trigger.pct, 1)}% (обрезано)</span>`);
   } else if (!cap.trigger.free) {
@@ -1308,9 +1385,26 @@ function finishDrag(): void {
   draw();
 }
 
+let wheelAccum = 0;
+let wheelStepAt = 0;
+
 function onWheel(event: WheelEvent): void {
   event.preventDefault();
-  const id = Math.min(25, Math.max(0, ui.timeDivId + Math.sign(event.deltaY)));
+  const now = performance.now();
+  const pixels = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+  // A trackpad flick arrives as dozens of events, momentum included, and this
+  // handler used to step once per event: one gesture raced the base from
+  // 10 ms/div to 1 ns/div and left the screen looking broken. A step now needs a
+  // notch's worth of scrolling, a pause since the last one, and a delta big
+  // enough not to be the tail of a gesture.
+  if (Math.abs(pixels) < 8) return;
+  if (now - wheelStepAt < 250) return;
+  wheelAccum += pixels;
+  if (Math.abs(wheelAccum) < 80) return;
+  const dir = Math.sign(wheelAccum);
+  wheelAccum = 0;
+  wheelStepAt = now;
+  const id = Math.min(25, Math.max(0, ui.timeDivId + dir));
   if (id === ui.timeDivId) return;
   ui.timeDivId = id;
   $<HTMLSelectElement>("time-div").value = String(id);

@@ -314,6 +314,11 @@ aside > section {
   font-size: 0.75rem;
 }
 
+/* A hint that is the reason the picture is not moving, not a footnote. */
+.hint.warn {
+  color: var(--warn);
+}
+
 button.wide {
   width: 100%;
 }
@@ -410,6 +415,11 @@ button.wide {
 }
 
 .metrics .sat {
+  grid-column: 1 / -1;
+  color: var(--warn);
+}
+
+.metrics .alias {
   grid-column: 1 / -1;
   color: var(--warn);
 }
