@@ -121,7 +121,14 @@ fn install(opts: &Options) -> Result<PathBuf, String> {
         .map(|(a, b)| a == b)
         .unwrap_or(false);
     if !same {
-        std::fs::copy(&me, &exe).map_err(|e| format!("не удалось скопировать программу: {e}"))?;
+        // A running copy keeps its own image open, and Windows refuses to
+        // overwrite it (os error 32). The program being installed over is almost
+        // always the one the person just left open, so close it and say so —
+        // silently failing here is what made the first installer look broken.
+        if !stop_running(&exe, opts) {
+            say(opts, "  программа:  закрыть не удалось — подменяю файл на месте");
+        }
+        copy_over(&me, &exe)?;
         say(opts, &format!("  программа:  {} ({} КБ)", exe.display(), size_kb(&exe)));
     } else {
         say(opts, &format!("  программа:  {} (уже на месте)", exe.display()));
@@ -169,6 +176,130 @@ fn install(opts: &Options) -> Result<PathBuf, String> {
 
 fn size_kb(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len() / 1024).unwrap_or(0)
+}
+
+/// Replace `to` with `from`, even when `to` is the image of a running process.
+///
+/// A plain copy fails with "файл занят другим процессом" (os error 32) while the
+/// old program runs. Windows will not let that file be rewritten, but it does let
+/// it be *renamed*: the loader opens executables with delete sharing. So the new
+/// copy is written alongside and swapped in by name, which leaves the next launch
+/// running the new build instead of failing the install.
+fn copy_over(from: &Path, to: &Path) -> Result<(), String> {
+    let new = to.with_extension("exe.new");
+    let old = to.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old);
+
+    match std::fs::copy(from, to) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.raw_os_error() == Some(32) => {}
+        Err(e) => return Err(format!("не удалось скопировать программу: {e}")),
+    }
+
+    std::fs::copy(from, &new)
+        .map_err(|e| format!("не удалось записать новую версию ({}): {e}", new.display()))?;
+    std::fs::rename(to, &old).map_err(|e| {
+        format!(
+            "программа запущена и не даёт себя заменить ({e}).\n  закройте её и повторите установку"
+        )
+    })?;
+    if let Err(e) = std::fs::rename(&new, to) {
+        // Put the working program back: a half-swapped install is worse than none.
+        let _ = std::fs::rename(&old, to);
+        return Err(format!("не удалось заменить программу: {e}"));
+    }
+    // The old image is still mapped by the process that would not close, so this
+    // can fail until it exits; a leftover `.exe.old` is collected next time.
+    let _ = std::fs::remove_file(&old);
+    Ok(())
+}
+
+/// PIDs of processes running the program at `exe`.
+///
+/// Enumeration goes through PowerShell because the alternative is another crate
+/// and a `Toolhelp32` walk, while this program already shells out for shortcuts
+/// and the uninstall entry. The path comparison is what matters: `davinci.exe` in
+/// `target\release` must not be mistaken for the installed one.
+fn pids_at(exe: &Path) -> Vec<u32> {
+    let script = r#"$ErrorActionPreference = 'SilentlyContinue'
+foreach ($p in Get-Process -Name davinci) {
+  $path = $null
+  try { $path = $p.Path } catch {}
+  if ($path) { '{0}|{1}' -f $p.Id, $path }
+}"#;
+    let Ok(out) = run_ps(script) else { return Vec::new() };
+
+    let want = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    out.lines()
+        .filter_map(|line| line.trim().split_once('|'))
+        .filter_map(|(pid, path)| {
+            let pid: u32 = pid.trim().parse().ok()?;
+            let got = PathBuf::from(path.trim())
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(path.trim()));
+            (got == want).then_some(pid)
+        })
+        .collect()
+}
+
+/// Close every running copy of the installed program. `true` when none is left.
+fn stop_running(exe: &Path, opts: &Options) -> bool {
+    let pids = pids_at(exe);
+    if pids.is_empty() {
+        return true;
+    }
+    let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    say(opts, &format!("  программа:  запущена (процесс {list}) — закрываю"));
+
+    let _ = run_ps(&format!(
+        "$ErrorActionPreference = 'SilentlyContinue'
+foreach ($p in Get-Process -Id {list}) {{ $null = $p.CloseMainWindow() }}"
+    ));
+    if wait_gone(exe, 4000) {
+        return true;
+    }
+
+    // No window, or it ignored the close request: an oscilloscope has nothing to
+    // save, so ending it is safe and beats a failed install.
+    let _ = run_ps(&format!(
+        "Stop-Process -Id {list} -Force -ErrorAction SilentlyContinue"
+    ));
+    wait_gone(exe, 4000)
+}
+
+fn wait_gone(exe: &Path, millis: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+    loop {
+        if pids_at(exe).is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Run a PowerShell script with no profile and no window, and return its stdout.
+fn run_ps(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &encode_utf16_base64(script),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("PowerShell не запустился: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Launch the installed copy in its own console window.
@@ -369,6 +500,24 @@ pub fn uninstall(args: &[String]) -> i32 {
     if !quiet {
         println!("\n  драйвер WinUSB оставлен: он принадлежит системе, а не программе.");
         println!("  снять его вручную: pnputil /delete-driver oem184.inf /uninstall /force");
+    }
+
+    // Another window left open would keep its image locked and the folder would
+    // survive the delete. Our own process is the caller, so it is never in this
+    // list — only copies someone else kept open.
+    let others: Vec<u32> = pids_at(&dir.join("davinci.exe"))
+        .into_iter()
+        .filter(|p| *p != std::process::id())
+        .collect();
+    if !others.is_empty() {
+        let list = others.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+        if !quiet {
+            println!("  закрываю запущенную копию (процесс {list})");
+        }
+        let _ = run_ps(&format!(
+            "Stop-Process -Id {list} -Force -ErrorAction SilentlyContinue"
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(600));
     }
 
     // We are executing from inside the directory we need to delete, so let a

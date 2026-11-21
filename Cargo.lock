@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "davinci"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hantek1008",
  "ico",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "hantek1008"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

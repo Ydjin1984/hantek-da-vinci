@@ -12,7 +12,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$version = '0.1.0'
+# Read once from the workspace manifest so the printed version cannot drift from
+# the one baked into the binaries.
+$version = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content (Join-Path $root 'Cargo.toml') -Raw)).Groups[1].Value
 $dist = Join-Path $root 'dist'
 
 Push-Location $root
