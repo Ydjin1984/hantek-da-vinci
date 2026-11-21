@@ -266,8 +266,8 @@ try {
     const cv = document.getElementById('plot');
     cv.focus();
     const send = (k) => cv.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
-    send('a'); for (let i = 0; i < 60; i++) send('ArrowLeft');
-    send('b'); for (let i = 0; i < 60; i++) send('ArrowLeft');
+    send('a'); for (let i = 0; i < 100; i++) send('ArrowLeft');
+    send('b'); for (let i = 0; i < 100; i++) send('ArrowLeft');
     for (let i = 0; i < 40; i++) send('ArrowRight');
   })()`;
   await evaluate(key);
@@ -277,7 +277,13 @@ try {
   const dtMs = dtMatch ? Number((dtMatch[2] ?? dtMatch[1]).replace(",", ".")) / (dtMatch[2] ? 1 : 1000) : NaN;
   const freqMatch = /1\/\|Δt\|\s*([\d.,]+)\s*Гц|1\/\|Δt\|\s*([\d.,]+)\s*кГц/.exec(cur);
   const freq = freqMatch ? Number((freqMatch[2] ?? freqMatch[1]).replace(",", ".")) * (freqMatch[2] ? 1000 : 1) : NaN;
-  const windowMs = (await capture()).window_s * 1000;
+  // The window comes from the same readout the Δt came from: the frame on screen
+  // is one acquisition, and the base is clamped, so a later capture() can describe
+  // a slightly different window and make a correct conversion look wrong.
+  const winMatch = /окно\s*([\d.,]+)\s*(мс|мкс)/.exec(cur);
+  const windowMs = winMatch
+    ? Number(winMatch[1].replace(",", ".")) * (winMatch[2] === "мс" ? 1 : 0.001)
+    : (await capture()).window_s * 1000;
   const expectedDt = 0.4 * windowMs;
   record(
     "курсоры показывают Δt в единицах кадра",

@@ -1062,8 +1062,13 @@ fn ingest(
             g.peaks[ch] = Peak { min: f32::INFINITY, max: f32::NEG_INFINITY };
         }
         let mut peak = g.peaks[ch];
-        for &v in raw {
-            peak.update((v as f32 - zero) * vpc);
+        // Peaks go through the same dropout repair as the trace. Otherwise one
+        // railed converter sample — the kind that is thrown out of every frame —
+        // stays in "пики за сеанс" until the user presses the reset button, and
+        // the panel claims a −20 V event the trace never showed.
+        let (counts, _) = crate::capture::repair_dropouts(raw);
+        for v in counts {
+            peak.update((v - zero) * vpc);
         }
         g.peaks[ch] = peak;
     }
@@ -1530,6 +1535,42 @@ mod tests {
         assert!(g.level_rescue.is_none());
         let (lo, hi) = g.source_span.expect("the panel still needs the range");
         assert!((hi - lo).abs() < 0.05, "span {lo}..{hi}");
+    }
+
+    #[test]
+    fn a_single_railed_sample_never_becomes_a_session_peak() {
+        // The signal lives around 0,3 V; one sample comes back on the rail. The
+        // frame repair drops it, so the "пики за сеанс" line must not advertise a
+        // −20 V event that nothing ever showed.
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Free;
+        let mut volts = vec![0.3f32; 1000];
+        volts[500] = 0.0;
+        // A block is built from counts, so a "rail" sample is count 0.
+        let range = Range::V20;
+        let vpc = range.volt_per_count();
+        let counts: Vec<u16> = volts
+            .iter()
+            .map(|v| (ZERO + v / vpc).round().clamp(0.0, ADC_MAX as f32) as u16)
+            .collect();
+        let mut raw = counts.clone();
+        raw[500] = 0;
+        let mut ch: [Option<Vec<u16>>; CHANNELS] = std::array::from_fn(|_| None);
+        ch[0] = Some(raw);
+        let block = Block { seq: 1, t_ns: 0, n: counts.len(), ch };
+        g.params.trigger = cfg;
+        let pinned = g.params.clone();
+        let reset = AtomicBool::new(false);
+        let generation = g.generation;
+        ingest(&mut g, block, &reset, &pinned, generation, 50_000.0, 0);
+        let peak = g.peaks[0];
+        assert!(
+            peak.min > -1.0,
+            "session peak kept the railed sample: {}",
+            peak.min
+        );
+        assert!(peak.max < 1.0, "session peak max {}", peak.max);
     }
 
     #[test]
