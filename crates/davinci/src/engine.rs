@@ -6,12 +6,14 @@
 //! the UI is always served a decimated envelope, which is what makes eight
 //! channels at once cheap to render and impossible to "lose" a peak.
 
+use crate::capture::Snapshot;
+use crate::trigger::{self, Config as TriggerConfig};
 use hantek1008::protocol::Measure;
 use hantek1008::{Block, Calibration, Device, Range, TimeDiv, CHANNELS};
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +35,12 @@ pub struct Params {
     /// Fit each channel's trace to its whole lane. A display setting: the device
     /// never sees it, but it is part of the state that must survive a restart.
     pub autoscale: [bool; CHANNELS],
+    /// Vertical centre of each lane, in volts: the view is shifted by this much.
+    /// Purely a display offset — the instrument always measures from 0 V.
+    pub center_v: [f32; CHANNELS],
+    /// Trigger settings. The engine applies them; the device knows nothing of
+    /// them, because the edge is found on the calibrated samples.
+    pub trigger: TriggerConfig,
 }
 
 impl Default for Params {
@@ -43,6 +51,8 @@ impl Default for Params {
             range_v: [20.0; CHANNELS],
             time_div: TimeDiv::DEFAULT,
             autoscale: [false; CHANNELS],
+            center_v: [0.0; CHANNELS],
+            trigger: TriggerConfig::default(),
         }
     }
 }
@@ -87,6 +97,16 @@ pub struct Status {
     pub log_bytes: u64,
     pub log_seconds: f64,
     pub blocks_total: u64,
+    /// Capture state: `free`, `waiting`, `captured`, `auto_free`, `stopped`.
+    pub state: String,
+    /// Identifier of the frame the capture endpoint would return right now.
+    pub frame_id: u64,
+    /// True while the screen is frozen.
+    pub held: bool,
+    /// True while the DAV log is recording.
+    pub rec: bool,
+    /// Trigger settings in force.
+    pub trigger: TriggerConfig,
 }
 
 struct Inner {
@@ -100,9 +120,48 @@ struct Inner {
     link: String,
     error: Option<String>,
     log: Option<LogState>,
-    started: Instant,
     blocks_total: u64,
     frame_counter: u64,
+    /// Bumped whenever something the acquisition depends on changes. A frame
+    /// carries the generation it was captured under, so a result computed with
+    /// old settings can never be presented as if it were the new ones.
+    generation: u64,
+    /// Last published frame, and the recent few kept by id for re-export.
+    last: Option<Arc<Snapshot>>,
+    recent: VecDeque<Arc<Snapshot>>,
+    /// Frame pinned by "Удержать экран".
+    held: Option<Arc<Snapshot>>,
+    publish_seq: u64,
+    state: CaptureState,
+    /// When the current wait for an edge began (Auto's timeout runs from here).
+    waiting_since: Option<Instant>,
+    /// Single-shot: armed by the user, cleared by the capture it produces.
+    armed: bool,
+    single_done: bool,
+    /// Bumped on every arm, so a block read started before the arm cannot
+    /// satisfy it.
+    arm_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureState {
+    Free,
+    Waiting,
+    Captured,
+    AutoFree,
+    Stopped,
+}
+
+impl CaptureState {
+    fn as_str(self) -> &'static str {
+        match self {
+            CaptureState::Free => "free",
+            CaptureState::Waiting => "waiting",
+            CaptureState::Captured => "captured",
+            CaptureState::AutoFree => "auto_free",
+            CaptureState::Stopped => "stopped",
+        }
+    }
 }
 
 struct LogState {
@@ -117,7 +176,6 @@ struct LogState {
 pub struct Engine {
     inner: Arc<Mutex<Inner>>,
     running: Arc<AtomicBool>,
-    seq: Arc<AtomicU64>,
     reset_peaks: Arc<AtomicBool>,
 }
 
@@ -131,6 +189,8 @@ impl Engine {
                     range_v: dev.ranges.map(|r| r.full_scale()),
                     time_div: dev.time_div,
                     autoscale: [false; CHANNELS],
+                    center_v: [0.0; CHANNELS],
+                    trigger: TriggerConfig::default(),
                 },
                 calib: dev.calib.clone(),
                 history: VecDeque::new(),
@@ -145,12 +205,20 @@ impl Engine {
                 link: dev.info.link.clone(),
                 error: None,
                 log: None,
-                started: Instant::now(),
                 blocks_total: 0,
                 frame_counter: 0,
+                generation: 0,
+                last: None,
+                recent: VecDeque::new(),
+                held: None,
+                publish_seq: 0,
+                state: CaptureState::Free,
+                waiting_since: None,
+                armed: false,
+                single_done: false,
+                arm_seq: 0,
             })),
             running: Arc::new(AtomicBool::new(true)),
-            seq: Arc::new(AtomicU64::new(0)),
             reset_peaks: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -173,12 +241,20 @@ impl Engine {
                 link,
                 error: Some(error),
                 log: None,
-                started: Instant::now(),
                 blocks_total: 0,
                 frame_counter: 0,
+                generation: 0,
+                last: None,
+                recent: VecDeque::new(),
+                held: None,
+                publish_seq: 0,
+                state: CaptureState::Stopped,
+                waiting_since: None,
+                armed: false,
+                single_done: false,
+                arm_seq: 0,
             })),
             running: Arc::new(AtomicBool::new(false)),
-            seq: Arc::new(AtomicU64::new(0)),
             reset_peaks: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -199,23 +275,29 @@ impl Engine {
             range_v: dev.ranges.map(|r| r.full_scale()),
             time_div: dev.time_div,
             autoscale: [false; CHANNELS],
+            center_v: [0.0; CHANNELS],
+            trigger: TriggerConfig::default(),
         };
         let mut last_rate_check = Instant::now();
         let mut blocks_at_check = 0u64;
         loop {
             // Push user changes down to the hardware before acquiring again.
             let want = { self.inner.lock().unwrap().params.clone() };
+            let mut touched = false;
             if want.enabled != applied.enabled {
                 let _ = dev.set_channels(&want.enabled);
                 applied.enabled = want.enabled.clone();
+                touched = true;
             }
             if want.ranges != applied.ranges {
                 let _ = dev.set_ranges(&want.ranges);
                 applied.ranges = want.ranges;
+                touched = true;
             }
             if want.time_div.id != applied.time_div.id {
                 let _ = dev.set_time_div(want.time_div);
                 applied.time_div = want.time_div;
+                touched = true;
             }
 
             // The time axis is defined by the time base and the number of
@@ -223,7 +305,18 @@ impl Engine {
             // always returns one screen of 4000 samples, split between the
             // enabled channels. Deriving the rate from throughput instead made
             // every frequency measurement drift with USB load.
-            self.inner.lock().unwrap().info_rate = implied_rate(&want);
+            let rate = implied_rate(&want);
+            {
+                let mut g = self.inner.lock().unwrap();
+                g.info_rate = rate;
+                // A block acquired from here on belongs to this configuration.
+                // Bumping the generation only when the device accepted the change
+                // keeps a failed `set_ranges` from labelling old data as new.
+                if touched {
+                    g.generation += 1;
+                    g.waiting_since = None;
+                }
+            }
 
             if !self.running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(20));
@@ -231,12 +324,21 @@ impl Engine {
                 let _ = dev.ping();
                 continue;
             }
+
+            // Pin the settings this read will be interpreted with, before the
+            // read: the user may change the range while USB is in flight, and the
+            // block that comes back belongs to the settings it was asked for.
+            let (pinned, generation, arm_seq) = {
+                let g = self.inner.lock().unwrap();
+                (g.params.clone(), g.generation, g.arm_seq)
+            };
+
             match dev.read_block() {
                 Ok(block) => {
                     let n = block.n;
                     let elapsed = {
                         let mut g = self.inner.lock().unwrap();
-                        ingest(&mut g, block, &self.reset_peaks);
+                        ingest(&mut g, block, &self.reset_peaks, &pinned, generation, rate, arm_seq);
                         g.blocks_total += 1;
                         g.blocks_total
                     };
@@ -276,10 +378,23 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub fn set_running(&self, on: bool) {
         self.running.store(on, Ordering::Relaxed);
-    }
-
-    pub fn running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        let mut g = self.inner.lock().unwrap();
+        if on {
+            // Resuming starts a fresh wait; the previous frame stays until one
+            // arrives, but it is no longer "the captured one".
+            g.waiting_since = None;
+            g.state = match g.params.trigger.mode {
+                trigger::Mode::Single => CaptureState::Waiting,
+                _ => CaptureState::Free,
+            };
+        } else {
+            g.state = CaptureState::Stopped;
+            // Stop cancels a pending arm: the request was for the run we just
+            // ended, and silently capturing after it would be a surprise.
+            g.armed = false;
+            g.arm_seq += 1;
+            g.waiting_since = None;
+        }
     }
 
     pub fn reset_peaks(&self) {
@@ -298,15 +413,6 @@ impl EngineHandle {
     pub fn set_time_div(&self, td: TimeDiv) {
         let mut g = self.inner.lock().unwrap();
         g.params.time_div = td;
-        g.persist();
-    }
-
-    pub fn set_range(&self, ch: usize, range: Range) {
-        let mut g = self.inner.lock().unwrap();
-        if ch < CHANNELS {
-            g.params.ranges[ch] = range;
-            g.params.range_v[ch] = range.full_scale();
-        }
         g.persist();
     }
 
@@ -344,6 +450,101 @@ impl EngineHandle {
             None => g.params.autoscale = [on; CHANNELS],
         }
         g.persist();
+    }
+
+    /// Replace the trigger settings, rejecting nonsense without touching state.
+    ///
+    /// The caller gets the reason, not a silent clamp: a UI that shows "30 %"
+    /// while the engine runs 10 % is worse than an error message.
+    pub fn set_trigger(&self, cfg: TriggerConfig) -> Result<(), String> {
+        cfg.validate()?;
+        let mut g = self.inner.lock().unwrap();
+        if !g.params.enabled.contains(&cfg.source) {
+            return Err(format!(
+                "источник триггера CH{} выключен",
+                cfg.source + 1
+            ));
+        }
+        let mode_changed = g.params.trigger.mode != cfg.mode;
+        g.params.trigger = cfg;
+        if mode_changed {
+            g.armed = false;
+            g.single_done = false;
+            g.arm_seq += 1;
+            g.waiting_since = None;
+        }
+        g.persist();
+        Ok(())
+    }
+
+    /// Arm the single-shot trigger.
+    pub fn arm(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.params.trigger.mode = trigger::Mode::Single;
+        g.armed = true;
+        g.single_done = false;
+        g.arm_seq += 1;
+        g.waiting_since = None;
+        g.state = CaptureState::Waiting;
+        self.running.store(true, Ordering::Relaxed);
+        g.persist();
+    }
+
+    /// Freeze or release the displayed frame.
+    ///
+    /// Acquisition and the DAV log keep running either way: holding is about what
+    /// the *screen* shows, not about stopping the instrument.
+    pub fn set_hold(&self, on: bool) {
+        let mut g = self.inner.lock().unwrap();
+        if on {
+            g.held = g.last.clone();
+        } else {
+            g.held = None;
+        }
+    }
+
+    /// Shift a lane's vertical centre. Display only: the samples are untouched.
+    pub fn set_center(&self, ch: usize, volts: f32) -> Result<(), String> {
+        if ch >= CHANNELS {
+            return Err(format!("канал {} вне диапазона 1..8", ch + 1));
+        }
+        if !volts.is_finite() || volts.abs() > 100.0 {
+            return Err("центр должен быть числом в пределах ±100 В".into());
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.params.center_v[ch] = volts;
+        g.persist();
+        Ok(())
+    }
+
+    /// The frame a client should draw, and whether it is frozen.
+    ///
+    /// With `frame_id` the request is for one specific capture: that is how CSV
+    /// and PNG stay pinned to the frame on screen even after the next sweep has
+    /// arrived. Without it, the held frame wins, then the newest one.
+    pub fn capture(&self, frame_id: Option<u64>) -> Option<Capture> {
+        let g = self.inner.lock().unwrap();
+        let held = g.held.is_some();
+        let snap = match frame_id {
+            Some(id) => g
+                .held
+                .as_ref()
+                .filter(|s| s.id == id)
+                .or_else(|| g.recent.iter().rev().find(|s| s.id == id))
+                .cloned(),
+            None => g.held.clone().or_else(|| g.last.clone()),
+        }?;
+        Some(Capture {
+            snapshot: snap,
+            held: held && frame_id.is_none(),
+            state: g.state.as_str(),
+            running: self.running.load(Ordering::Relaxed),
+        })
+    }
+
+    /// CSV of one frame: the pinned one, or whatever is on screen.
+    pub fn frame_csv(&self, frame_id: Option<u64>) -> Option<String> {
+        self.capture(frame_id).map(|c| c.snapshot.csv())
     }
 
     /// Everything currently held in memory as CSV, for the "Экспорт" button.
@@ -410,7 +611,25 @@ impl EngineHandle {
                 g.params.range_v[i] = v;
                 g.params.ranges[i] = Range::covering(v);
             }
+            if let Some(c) = s.center_v.get(i) {
+                if c.is_finite() && c.abs() <= 100.0 {
+                    g.params.center_v[i] = *c;
+                }
+            }
         }
+        // A restored trigger must never come back armed: a program that starts
+        // already waiting for a single edge looks frozen and takes one shot
+        // nobody asked for.
+        g.params.trigger = s.trigger.clone();
+        g.params.trigger.mode = match s.trigger.mode {
+            trigger::Mode::Single => trigger::Mode::Normal,
+            m => m,
+        };
+        if !g.params.enabled.contains(&g.params.trigger.source) {
+            g.params.trigger.source = g.params.enabled.first().copied().unwrap_or(0);
+        }
+        g.armed = false;
+        g.single_done = false;
     }
 
     pub fn status(&self) -> Status {
@@ -429,6 +648,11 @@ impl EngineHandle {
                 g.params.time_div.real_window_s(n) > g.params.time_div.window_s() * 1.02
             },
             error: g.error.clone(),
+            state: g.state.as_str().to_string(),
+            frame_id: g.held.as_ref().or(g.last.as_ref()).map(|s| s.id).unwrap_or(0),
+            held: g.held.is_some(),
+            rec: g.log.is_some(),
+            trigger: g.params.trigger.clone(),
             log_path: g.log.as_ref().map(|l| l.path.display().to_string()),
             log_bytes: g.log.as_ref().map(|l| l.bytes).unwrap_or(0),
             log_seconds: g.log.as_ref().map(|l| l.started_at.elapsed().as_secs_f64()).unwrap_or(0.0),
@@ -525,11 +749,6 @@ impl EngineHandle {
                 })
             })
             .collect()
-    }
-
-    pub fn params(&self) -> (Params, Calibration) {
-        let g = self.inner.lock().unwrap();
-        (g.params.clone(), g.calib.clone())
     }
 
     /// Build the min/max envelope the UI draws.
@@ -645,14 +864,23 @@ impl Inner {
             range_v: self.params.range_v.to_vec(),
             time_div_id: self.params.time_div.id,
             autoscale: self.params.autoscale.to_vec(),
+            center_v: self.params.center_v.to_vec(),
+            trigger: self.params.trigger.clone(),
         }
         .save();
     }
 }
 
+/// Answer to "what should be on screen right now".
+pub struct Capture {
+    pub snapshot: Arc<Snapshot>,
+    pub held: bool,
+    pub state: &'static str,
+    pub running: bool,
+}
+
 /// One decimated view of one acquisition.
-pub struct Frame {
-    pub width: usize,
+pub struct Frame {    pub width: usize,
     pub channels: Vec<usize>,
     pub dt_s: f32,
     pub t0_ns: u64,
@@ -707,19 +935,28 @@ fn median(v: &mut [f32]) -> Option<f32> {
     Some(v[v.len() / 2])
 }
 
-fn ingest(g: &mut Inner, block: Block, reset: &AtomicBool) {
-    let rate = if g.info_rate > 0.0 {
-        g.info_rate
-    } else if let Ok(v) = std::env::var("DAVINCI_FIXED_RATE") {
-        v.parse::<f64>().unwrap_or(50_000.0)
-    } else {
-        50_000.0
-    };
+/// Absorb one block: peaks, log, history, and the trigger decision.
+///
+/// `pinned` is the settings the block was *requested* with, `generation` the
+/// configuration they belong to and `rate` the sample rate they imply. Nothing
+/// here reads `g.params`: a range changed while USB was in flight must not be
+/// applied to data taken before it, which is exactly the bug the spec calls
+/// "публикация запоздавшего кадра с новыми метаданными".
+fn ingest(
+    g: &mut Inner,
+    block: Block,
+    reset: &AtomicBool,
+    pinned: &Params,
+    generation: u64,
+    rate: f64,
+    arm_seq: u64,
+) {
     let do_reset = reset.swap(false, Ordering::Relaxed);
+    let dt = (1.0 / rate) as f32;
 
     for ch in 0..CHANNELS {
         let Some(raw) = &block.ch[ch] else { continue };
-        let range = g.params.ranges[ch];
+        let range = pinned.ranges[ch];
         let zero = g.calib.zero(range, ch);
         let vpc = range.volt_per_count();
         if do_reset {
@@ -769,13 +1006,6 @@ fn ingest(g: &mut Inner, block: Block, reset: &AtomicBool) {
     g.frame_counter += 1;
     g.history.push_back(Arc::new(block));
     let cap = (HISTORY_SECONDS * rate) as usize;
-    let mut have = 0usize;
-    for b in g.history.iter().rev() {
-        have += b.n;
-        if have > cap {
-            break;
-        }
-    }
     while g.history.len() > 8 {
         let total: usize = g.history.iter().map(|b| b.n).sum();
         if total <= cap {
@@ -783,6 +1013,172 @@ fn ingest(g: &mut Inner, block: Block, reset: &AtomicBool) {
         }
         g.history.pop_front();
     }
+
+    let block = g.history.back().expect("just pushed").clone();
+    let cfg = pinned.trigger.clone();
+    let mode = cfg.mode;
+
+    // Single-shot only captures for the arm that is current *now*: a block whose
+    // read started before the button was pressed was not asked for and must not
+    // satisfy the request.
+    if mode == trigger::Mode::Single {
+        if g.armed && arm_seq == g.arm_seq {
+            // Fall through: this block is the one the arm is waiting for.
+        } else {
+            g.state = if g.single_done {
+                CaptureState::Captured
+            } else {
+                CaptureState::Waiting
+            };
+            return;
+        }
+    }
+
+    let source_volts = block.ch[cfg.source].as_ref().map(|raw| {
+        let range = pinned.ranges[cfg.source];
+        let zero = g.calib.zero(range, cfg.source);
+        let vpc = range.volt_per_count();
+        raw.iter().map(|&v| (v as f32 - zero) * vpc).collect::<Vec<f32>>()
+    });
+
+    let hysteresis = cfg.hysteresis(pinned.ranges[cfg.source].resolution());
+    let found = if mode == trigger::Mode::Free {
+        None
+    } else {
+        source_volts.as_deref().and_then(|s| {
+            // Prefer an edge with enough history before it; fall back to the first
+            // one so a signal that crosses only once is still captured, with the
+            // window flags telling the truth about the missing side.
+            trigger::best_crossing(s, &cfg, hysteresis)
+                .or_else(|| trigger::first_crossing(s, &cfg, hysteresis))
+        })
+    };
+
+    let awaiting = g
+        .waiting_since
+        .map(|t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+
+    match trigger::decide(mode, found.is_some(), awaiting, cfg.timeout_ms) {
+        trigger::Outcome::Publish => {
+            let win = found
+                .map(|t| trigger::window(t, block.n, cfg.pretrigger_pct))
+                .unwrap_or_else(|| trigger::Window::whole(block.n));
+            publish(g, &block, pinned, generation, dt, &cfg, win, false);
+            g.state = CaptureState::Captured;
+            g.waiting_since = None;
+            if mode == trigger::Mode::Single {
+                g.armed = false;
+                g.single_done = true;
+            }
+        }
+        trigger::Outcome::PublishFree => {
+            let win = trigger::Window::whole(block.n);
+            publish(g, &block, pinned, generation, dt, &cfg, win, true);
+            g.state = if mode == trigger::Mode::Free {
+                CaptureState::Free
+            } else {
+                CaptureState::AutoFree
+            };
+            // Auto starts a fresh timeout after every free frame, so a quiet
+            // signal gets roughly one screen per timeout rather than a freeze.
+            g.waiting_since = None;
+        }
+        trigger::Outcome::Wait => {
+            if g.waiting_since.is_none() {
+                g.waiting_since = Some(Instant::now());
+            }
+            g.state = CaptureState::Waiting;
+        }
+    }
+}
+
+/// Freeze one window of one block into a [`Snapshot`].
+#[allow(clippy::too_many_arguments)]
+fn publish(
+    g: &mut Inner,
+    block: &Block,
+    pinned: &Params,
+    generation: u64,
+    dt: f32,
+    cfg: &TriggerConfig,
+    win: trigger::Window,
+    free: bool,
+) {
+    let n = block.n;
+    if n < 2 {
+        return;
+    }
+    let start_i = win.start.floor().max(0.0) as usize;
+    let end_i = ((win.start + win.len).ceil() as usize).min(n - 1);
+    let start_i = start_i.min(end_i);
+
+    let mut channels = Vec::with_capacity(pinned.enabled.len());
+    let mut samples = Vec::with_capacity(pinned.enabled.len());
+    let mut stats = Vec::with_capacity(pinned.enabled.len());
+    let mut saturation = Vec::with_capacity(pinned.enabled.len());
+    let mut dropouts = Vec::with_capacity(pinned.enabled.len());
+
+    for &ch in &pinned.enabled {
+        let Some(raw) = &block.ch[ch] else { continue };
+        let end = end_i.min(raw.len().saturating_sub(1));
+        let start = start_i.min(end);
+        let range = pinned.ranges[ch];
+        let zero = g.calib.zero(range, ch);
+        let vpc = range.volt_per_count();
+        // One rail sample between two ordinary ones is a converter dropout, not a
+        // 20 V event; repairing it keeps a single glitch from painting a full-scale
+        // spike across the trace.
+        let (counts, fixed) = crate::capture::repair_dropouts(&raw[start..=end]);
+        let volts: Vec<f32> = counts.iter().map(|&c| (c - zero) * vpc).collect();
+        if volts.len() < 2 {
+            continue;
+        }
+        stats.push(Measure::of(&volts, dt));
+        // Saturation is about the converter, not the drawn scale: a rail-to-rail
+        // input on a wide range is not "saturated", it is simply 20 V. Runs of rail
+        // samples survive the repair above, so this still reports real clipping.
+        saturation.push(volts.iter().any(|v| v.abs() >= range.full_scale() * 0.99));
+        dropouts.push(fixed);
+        channels.push(ch);
+        samples.push(volts);
+    }
+    if channels.is_empty() {
+        return;
+    }
+
+    g.publish_seq += 1;
+    let snap = Snapshot {
+        id: g.publish_seq,
+        generation,
+        dt_s: dt as f64,
+        channels,
+        samples,
+        start: win.start,
+        len: win.len,
+        n_block: n,
+        cfg: cfg.clone(),
+        free,
+        pct: win.pct,
+        clipped_pre: win.clipped_pre,
+        clipped_post: win.clipped_post,
+        range_v: pinned.range_v,
+        range_id: pinned.ranges.map(|r| r.id()),
+        center_v: pinned.center_v,
+        autoscale: pinned.autoscale,
+        stats,
+        saturation,
+        dropouts,
+        peak_min: g.peaks.map(|p| p.min),
+        peak_max: g.peaks.map(|p| p.max),
+        hysteresis_v: cfg.hysteresis(pinned.ranges[cfg.source].resolution()),
+    };
+    let snap = Arc::new(snap);
+    g.recent.push_back(Arc::clone(&snap));
+    while g.recent.len() > 48 {
+        g.recent.pop_front();
+    }
+    g.last = Some(snap);
 }
 
 /// Sample rate implied by the time base and the number of enabled channels.
@@ -809,4 +1205,212 @@ pub fn fixed_rate() -> f64 {
 /// Unix seconds, for the log header and file names.
 pub fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hantek1008::protocol::{Block, ADC_MAX};
+
+    fn inner() -> Inner {
+        Inner {
+            params: Params::default(),
+            calib: Calibration::default(),
+            history: VecDeque::new(),
+            peaks: [Peak { min: f32::INFINITY, max: f32::NEG_INFINITY }; CHANNELS],
+            info_rate: 50_000.0,
+            block_samples: 0,
+            blocks_per_s: 0.0,
+            link: "тест".into(),
+            error: None,
+            log: None,
+            blocks_total: 0,
+            frame_counter: 0,
+            generation: 0,
+            last: None,
+            recent: VecDeque::new(),
+            held: None,
+            publish_seq: 0,
+            state: CaptureState::Free,
+            waiting_since: None,
+            armed: false,
+            single_done: false,
+            arm_seq: 0,
+        }
+    }
+
+    /// A block whose channel 0 carries `volts`, as the ADC would report them.
+    fn block(volts: &[f32], range: Range) -> Block {
+        let zero = ZERO;
+        let vpc = range.volt_per_count();
+        let counts: Vec<u16> = volts
+            .iter()
+            .map(|v| (zero + v / vpc).round().clamp(0.0, ADC_MAX as f32) as u16)
+            .collect();
+        let n = counts.len();
+        let mut ch: [Option<Vec<u16>>; CHANNELS] = std::array::from_fn(|_| None);
+        ch[0] = Some(counts);
+        Block { seq: 1, t_ns: 0, n, ch }
+    }
+
+    const ZERO: f32 = 2048.0;
+
+    fn sine(n: usize, freq: f64, amp: f32, offset: f32, rate: f64) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / rate;
+                offset + amp * ((2.0 * std::f64::consts::PI * freq * t) as f32).sin()
+            })
+            .collect()
+    }
+
+    fn run(g: &mut Inner, cfg: TriggerConfig, volts: &[f32], arm_seq: u64) {
+        g.params.trigger = cfg.clone();
+        let pinned = g.params.clone();
+        let reset = AtomicBool::new(false);
+        ingest(g, block(volts, Range::V20), &reset, &pinned, g.generation, 50_000.0, arm_seq);
+    }
+
+    #[test]
+    fn free_mode_publishes_every_block_without_a_trigger() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Free;
+        run(&mut g, cfg.clone(), &sine(1000, 125.0, 1.0, 0.0, 50_000.0), 0);
+        let first = g.last.as_ref().map(|s| s.id).unwrap();
+        assert!(g.last.as_ref().unwrap().free);
+        assert_eq!(g.state, CaptureState::Free);
+        run(&mut g, cfg, &sine(1000, 125.0, 1.0, 0.0, 50_000.0), 0);
+        assert_ne!(g.last.as_ref().map(|s| s.id).unwrap(), first);
+    }
+
+    #[test]
+    fn normal_mode_waits_when_the_level_is_never_crossed() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Normal;
+        cfg.level_v = 5.0;
+        run(&mut g, cfg, &sine(1000, 125.0, 1.0, 0.0, 50_000.0), 0);
+        assert!(g.last.is_none(), "nothing may be published without an edge");
+        assert_eq!(g.state, CaptureState::Waiting);
+    }
+
+    #[test]
+    fn normal_mode_captures_on_the_edge_and_places_it_at_the_pretrigger() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Normal;
+        cfg.level_v = 0.5;
+        cfg.pretrigger_pct = 30.0;
+        run(&mut g, cfg, &sine(4000, 125.0, 1.0, 0.0, 50_000.0), 0);
+        let snap = g.last.as_ref().expect("a frame");
+        assert!(!snap.free);
+        assert_eq!(g.state, CaptureState::Captured);
+        assert!((snap.pct - 30.0).abs() < 0.5, "pct {}", snap.pct);
+        // The edge really is where the window claims it is.
+        let idx = (snap.pct as f64 / 100.0 * snap.len) as usize;
+        let s = &snap.samples[0];
+        let at = s[idx.min(s.len() - 1)];
+        assert!((at - 0.5).abs() < 0.15, "voltage at T0 is {at}");
+    }
+
+    #[test]
+    fn single_shot_captures_once_per_arm() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Single;
+        cfg.level_v = 0.5;
+        g.params.trigger = cfg.clone();
+        g.armed = true;
+        g.arm_seq = 1;
+        let pinned = g.params.clone();
+        let reset = AtomicBool::new(false);
+        ingest(&mut g, block(&sine(4000, 125.0, 1.0, 0.0, 50_000.0), Range::V20), &reset, &pinned, 0, 50_000.0, 1);
+        let id = g.last.as_ref().expect("captured").id;
+        assert!(g.single_done && !g.armed);
+        assert_eq!(g.state, CaptureState::Captured);
+
+        // A second block without a new arm must not replace the capture.
+        ingest(&mut g, block(&sine(4000, 125.0, 1.0, 0.0, 50_000.0), Range::V20), &reset, &pinned, 0, 50_000.0, 1);
+        assert_eq!(g.last.as_ref().map(|s| s.id), Some(id));
+    }
+
+    #[test]
+    fn a_block_read_before_the_arm_cannot_satisfy_it() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Single;
+        cfg.level_v = 0.5;
+        g.params.trigger = cfg;
+        g.armed = true;
+        g.arm_seq = 5;
+        let pinned = g.params.clone();
+        let reset = AtomicBool::new(false);
+        // The read started when arm_seq was 4: it belongs to the previous state.
+        ingest(&mut g, block(&sine(4000, 125.0, 1.0, 0.0, 50_000.0), Range::V20), &reset, &pinned, 0, 50_000.0, 4);
+        assert!(g.last.is_none(), "a stale block must not be published");
+        assert!(g.armed);
+    }
+
+    #[test]
+    fn a_published_frame_keeps_the_metadata_of_its_own_block() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Free;
+        g.params.trigger = cfg;
+        g.params.range_v = [1.0; CHANNELS];
+        g.params.center_v[0] = 0.5;
+        let pinned = g.params.clone();
+        let reset = AtomicBool::new(false);
+        ingest(&mut g, block(&sine(1000, 125.0, 1.0, 0.0, 50_000.0), Range::V20), &reset, &pinned, 7, 50_000.0, 0);
+
+        // The user changes the scale afterwards; the frame must not follow.
+        g.params.range_v = [20.0; CHANNELS];
+        g.params.center_v[0] = 0.0;
+        let snap = g.last.as_ref().unwrap();
+        assert_eq!(snap.generation, 7);
+        assert!((snap.range_v[0] - 1.0).abs() < 1e-6);
+        assert!((snap.center_v[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn statistics_come_from_the_frames_own_samples() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Free;
+        run(&mut g, cfg, &sine(4000, 125.0, 1.0, 0.0, 50_000.0), 0);
+        let snap = g.last.as_ref().unwrap();
+        let m = snap.stats[0];
+        assert!((m.vmax - 1.0).abs() < 0.05, "vmax {}", m.vmax);
+        assert!((m.vmin + 1.0).abs() < 0.05, "vmin {}", m.vmin);
+        assert!((m.freq.unwrap() - 125.0).abs() < 3.0, "freq {:?}", m.freq);
+    }
+
+    #[test]
+    fn hold_pins_the_frame_while_acquisition_moves_on() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Free;
+        run(&mut g, cfg.clone(), &sine(1000, 125.0, 1.0, 0.0, 50_000.0), 0);
+        let held = g.last.clone().unwrap();
+        g.held = Some(held.clone());
+        run(&mut g, cfg, &sine(1000, 250.0, 1.0, 0.0, 50_000.0), 0);
+        assert_ne!(g.last.as_ref().unwrap().id, held.id);
+        assert_eq!(g.held.as_ref().unwrap().id, held.id);
+    }
+
+    #[test]
+    fn recent_frames_are_bounded() {
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Free;
+        g.params.trigger = cfg;
+        let pinned = g.params.clone();
+        let reset = AtomicBool::new(false);
+        for _ in 0..70 {
+            ingest(&mut g, block(&sine(200, 125.0, 1.0, 0.0, 50_000.0), Range::V20), &reset, &pinned, 0, 50_000.0, 0);
+        }
+        assert_eq!(g.recent.len(), 48);
+        assert_eq!(g.publish_seq, 70);
+    }
 }

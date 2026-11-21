@@ -5,6 +5,7 @@
 //! он крошечный, а «последнее состояние» должно быть всегда, даже если
 //! программу закрыли крестиком, не нажав «Стоп».
 
+use crate::trigger::Config as TriggerConfig;
 use hantek1008::{Device, Range, TimeDiv, CHANNELS};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -31,6 +32,16 @@ pub struct Settings {
     /// Авто-масштаб по каналам.
     #[serde(default)]
     pub autoscale: Vec<bool>,
+    /// Смещение вида по вертикали, вольты (не влияет на измерение).
+    #[serde(default)]
+    pub center_v: Vec<f32>,
+    /// Триггер: режим, источник, фронт, уровень и положение T₀.
+    ///
+    /// `#[serde(default)]` на уровне поля, а не «всё или ничего»: файл от
+    /// предыдущей версии не содержит триггера вообще, и он должен прочитаться,
+    /// а не превратиться в настройки по умолчанию целиком.
+    #[serde(default)]
+    pub trigger: TriggerConfig,
 }
 
 fn default_time_div_id() -> u8 {
@@ -45,6 +56,8 @@ impl Default for Settings {
             range_v: vec![20.0; CHANNELS],
             time_div_id: DEFAULT_TIME_DIV_ID,
             autoscale: vec![false; CHANNELS],
+            center_v: vec![0.0; CHANNELS],
+            trigger: TriggerConfig::default(),
         }
     }
 }
@@ -111,6 +124,37 @@ impl Settings {
         }
         for v in &mut self.range_v {
             *v = v.clamp(0.05, 20.0);
+        }
+
+        self.center_v.resize(CHANNELS, 0.0);
+        for v in &mut self.center_v {
+            if !v.is_finite() {
+                *v = 0.0;
+            }
+            *v = v.clamp(-100.0, 100.0);
+        }
+
+        // Триггер приходит из файла (или из умолчаний) и чинится, а не
+        // отбрасывается: неверный источник должен стать первым включённым
+        // каналом, а не оставить программу без триггера.
+        self.trigger.pretrigger_pct = if self.trigger.pretrigger_pct.is_finite() {
+            self.trigger.pretrigger_pct.clamp(10.0, 90.0)
+        } else {
+            crate::trigger::DEFAULT_PRETRIGGER_PCT
+        };
+        if !self.trigger.level_v.is_finite() {
+            self.trigger.level_v = 0.0;
+        }
+        if self.trigger.timeout_ms > crate::trigger::MAX_TIMEOUT_MS {
+            self.trigger.timeout_ms = crate::trigger::DEFAULT_TIMEOUT_MS;
+        }
+        if self.enabled.is_empty() || !self.enabled.contains(&self.trigger.source) {
+            self.trigger.source = self.enabled.first().copied().unwrap_or(0);
+        }
+        // Один взвод не переживает перезапуск: приложение, стартующее в
+        // ожидании одного фронта, выглядит зависшим.
+        if self.trigger.mode == crate::trigger::Mode::Single {
+            self.trigger.mode = crate::trigger::Mode::Normal;
         }
     }
 

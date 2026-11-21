@@ -11,11 +11,13 @@
 
 mod app;
 mod assets;
+mod capture;
 mod driver;
 mod engine;
 mod http;
 mod install;
 mod settings;
+mod trigger;
 // The native window. Only Windows has one; everywhere else the interface is
 // still served over HTTP and opened in a browser.
 #[cfg(windows)]

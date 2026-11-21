@@ -1,18 +1,33 @@
+/* Interface for the Hantek 1008 scope.
+ *
+ * Same shape as the reference stand-alone mock: a header with the transport
+ * state, the plot in a bordered panel, and a right column with trigger, cursors
+ * and channels. Everything is sized in rem so a Windows DPI change scales the
+ * whole window instead of breaking one panel.
+ */
+
 :root {
-  /* Native widgets follow this: scrollbars, the range dropdown, focus rings.
-     Without it WebView2 draws them in the system light theme on a black panel. */
   color-scheme: dark;
-  --bg: #080b10;
-  --panel: #0c1117;
-  --panel-2: #0f151d;
-  --line: #1a2330;
-  --text: #d7e2ef;
-  --muted: #6b7c93;
-  --accent: #34d399;
-  --warn: #fbbf24;
-  --bad: #f87171;
-  --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
-  --sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --bg: #0d0e12;
+  --panel: #15171e;
+  --panel-2: #101318;
+  --line: #2a2e39;
+  --line-soft: #222936;
+  --text: #eef0f6;
+  --muted: #a0a8b8;
+  --accent: #ff525c;
+  --accent-soft: #ff8e95;
+  --ok: #46e1aa;
+  --warn: #ffd16c;
+  --cursor: #bda2ff;
+  --ch1: #46e1aa;
+  --ch2: #ffd16c;
+  --ch3: #ff91be;
+  --ch4: #7bacff;
+  --ch5: #bba5ff;
+  --ch6: #ff8181;
+  --ch7: #55d8ef;
+  --ch8: #c4e97b;
 }
 
 * {
@@ -22,334 +37,410 @@
 html,
 body {
   height: 100%;
+}
+
+body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: var(--sans);
+  font: 14px/1.35 system-ui, "Segoe UI", sans-serif;
   overflow: hidden;
+}
+
+button,
+select,
+input {
+  font: inherit;
+  color: inherit;
+  background: #20232d;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 9px;
+}
+
+button {
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:hover:not(:disabled) {
+  border-color: #858b9b;
+}
+
+button:disabled,
+select:disabled,
+input:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button[aria-pressed="true"] {
+  background: #44262e;
+  border-color: #f25761;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 2px;
 }
 
 #app {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
+  min-height: 0;
 }
 
-/* ---------------------------------------------------------------- header */
-
-.bar {
+header {
   display: flex;
+  gap: 1rem;
   align-items: center;
-  gap: 20px;
-  padding: 10px 16px;
-  background: linear-gradient(180deg, #0d131a, #0a0e13);
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding: 0.7rem 1rem;
   border-bottom: 1px solid var(--line);
-  flex: 0 0 auto;
+  background: var(--panel);
 }
 
 .brand {
   display: flex;
+  gap: 0.65rem;
   align-items: center;
-  gap: 12px;
-  min-width: 250px;
 }
 
 .logo {
-  display: grid;
-  place-items: center;
-  width: 38px;
-  height: 38px;
+  background: #402027;
+  color: #ff6973;
   border-radius: 10px;
-  background: radial-gradient(circle at 30% 25%, #123a2c, #0b1a14 70%);
-  border: 1px solid #1d4b3a;
-  color: var(--accent);
-  font-size: 22px;
-  line-height: 1;
+  padding: 0.25rem 0.6rem;
+  font-size: 1.35rem;
 }
 
 .brand h1 {
   margin: 0;
-  font-size: 15px;
-  font-weight: 650;
-  letter-spacing: 0.2px;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
 }
 
 .brand p {
-  margin: 2px 0 0;
-  font-size: 10.5px;
+  margin: 0;
+  font-size: 0.78rem;
   color: var(--muted);
-  font-family: var(--mono);
 }
 
-.chips {
-  display: flex;
-  gap: 8px;
-  flex: 1 1 auto;
-  flex-wrap: wrap;
-}
-
-.chip {
-  padding: 5px 10px;
-  border-radius: 999px;
-  background: var(--panel-2);
+.pill {
   border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.78rem;
   color: var(--muted);
-  font-size: 11px;
-  font-family: var(--mono);
-  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
-.chip.ok {
-  color: #7ee2b8;
-  border-color: #1d4b3a;
-  background: #0d1f18;
+.pill.ok {
+  color: var(--ok);
+  border-color: #2b5b48;
 }
 
-.chip.bad {
-  color: #ffb4b4;
-  border-color: #4b1d1d;
-  background: #1f0d0d;
+.pill.bad {
+  color: var(--accent-soft);
+  border-color: #6b2a31;
 }
 
-.chip.log {
-  color: #ffd68a;
-  border-color: #4b3a1d;
-  background: #1f180d;
+.pill.rec {
+  color: var(--accent-soft);
+  border-color: #6b2a31;
 }
 
 .actions {
   display: flex;
-  gap: 8px;
+  gap: 0.45rem;
+  align-items: center;
+  flex-wrap: wrap;
 }
-
-.btn {
-  padding: 7px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--panel-2);
-  color: var(--text);
-  font-size: 12px;
-  font-family: var(--sans);
-  cursor: pointer;
-  transition: border-color 0.15s, background 0.15s, color 0.15s;
-}
-
-.btn:hover {
-  border-color: #2b3a4d;
-  background: #131b24;
-}
-
-.btn.primary {
-  border-color: #1d4b3a;
-  background: #0f2a20;
-  color: #8ef0c5;
-}
-
-.btn.on {
-  border-color: #4b3a1d;
-  background: #241a0d;
-  color: #ffd68a;
-}
-
-/* ------------------------------------------------------------------ main */
 
 main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 21rem;
+  gap: 0.75rem;
+  padding: 0.75rem;
   flex: 1 1 auto;
-  display: flex;
   min-height: 0;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
   overflow: hidden;
 }
 
 .scope {
-  position: relative;
-  flex: 1 1 auto;
-  min-width: 0;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
-  background: var(--bg);
+  min-width: 0;
 }
 
-#plot {
-  position: absolute;
-  inset: 0;
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.toolbar label {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.toolbar .spacer {
+  flex: 1 1 auto;
+}
+
+.status {
+  font-size: 0.82rem;
+  color: var(--muted);
+  min-height: 1.2em;
+}
+
+.status.error {
+  color: var(--accent-soft);
+}
+
+.plot-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0 0.55rem;
+  border: 1px solid #282d35;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0d1016;
+}
+
+canvas {
   display: block;
   width: 100%;
   height: 100%;
-  cursor: crosshair;
+  touch-action: none;
+}
+
+.readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1.1rem;
+  padding: 0.5rem 0.8rem;
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 0.82rem;
+  min-height: 2.2rem;
+  border-top: 1px solid var(--line-soft);
+  color: var(--text);
+}
+
+.readout span b {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.foot {
+  padding: 0 0.8rem 0.55rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+aside {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+/* Panels keep their content height: letting flex shrink them clipped the cursor
+ * select in half on a 900 px window. */
+aside > section {
+  flex: 0 0 auto;
+}
+
+.section {
+  padding: 0.7rem 0.8rem;
+  display: grid;
+  gap: 0.5rem;
+  align-content: start;
+}
+
+.section h2 {
+  margin: 0;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.field > select,
+.field > input[type="number"] {
+  width: 8.6rem;
+}
+
+.field input[type="range"] {
+  width: 7rem;
+  accent-color: var(--accent);
+}
+
+.field output {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 2.6rem;
+  text-align: right;
 }
 
 .hint {
-  position: absolute;
-  left: 110px;
-  bottom: 34px;
-  font-size: 10.5px;
-  color: #40506a;
-  font-family: var(--mono);
-  pointer-events: none;
-  transition: opacity 1.2s;
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
-/* ----------------------------------------------------------------- cards */
+button.wide {
+  width: 100%;
+}
 
-.cards {
-  flex: 0 0 330px;
-  border-left: 1px solid var(--line);
-  background: var(--panel);
-  overflow-y: auto;
-  /* Setting one axis to auto makes the other auto as well, and half a pixel of
-     rounding then adds a horizontal scrollbar to a column that only ever needs
-     to scroll down. */
-  overflow-x: hidden;
+.channels {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  padding: 10px;
-  align-content: start;
-  /* Eight cards do not fit in a window height by definition, so this column
-     scrolls — but a white system scrollbar on a black panel looks like a bug. */
-  scrollbar-width: thin;
-  scrollbar-color: #2a3646 transparent;
+  gap: 0.4rem;
 }
 
-.card {
-  /* Grid items are as wide as their content by default, which quietly widened
-     this column past its 330 px and pushed the right-hand cards out of the
-     window. */
-  min-width: 0;
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--c);
-  border-radius: 8px;
-  padding: 8px 9px 9px;
+.channel {
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  padding: 0.45rem 0.55rem;
+  display: grid;
+  gap: 0.35rem;
   background: var(--panel-2);
 }
 
-.card.off {
-  opacity: 0.38;
+.channel.off {
+  opacity: 0.6;
 }
 
-.card-top {
+.channel.off .settings {
+  display: none;
+}
+
+.channel.active {
+  border-color: #4a4258;
+}
+
+.channel-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  margin-bottom: 7px;
+  gap: 0.45rem;
+}
+
+.channel-head label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 600;
+  font-size: 0.85rem;
 }
 
 .dot {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  border: 1px solid var(--c);
-  background: color-mix(in srgb, var(--c) 18%, transparent);
-  color: var(--c);
-  font-family: var(--mono);
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-  padding: 0;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 999px;
+  display: inline-block;
 }
 
-select.range {
-  width: 100%;
-  margin-bottom: 6px;
-  font-size: 10px;
+.channel-head .range {
+  margin-left: auto;
+  font-size: 0.72rem;
   color: var(--muted);
-  font-family: var(--mono);
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  background: var(--panel);
-  padding: 2px 4px;
-  cursor: pointer;
-  appearance: none;
-  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
-select.range:hover,
-select.range:focus {
-  border-color: var(--c);
-  color: var(--c);
-  outline: none;
-}
-
-.big {
-  font-family: var(--mono);
-  font-size: 17px;
-  font-weight: 700;
-  color: var(--c);
-  margin-bottom: 6px;
-  letter-spacing: -0.3px;
-}
-
-.row {
+.settings {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 10.5px;
-  line-height: 1.55;
-  color: var(--muted);
-}
-
-.auto {
-  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.5rem;
   align-items: center;
-  gap: 5px;
-  margin-bottom: 6px;
-  font-size: 10px;
+  font-size: 0.78rem;
   color: var(--muted);
-  font-family: var(--mono);
-  cursor: pointer;
-  user-select: none;
 }
 
-.auto input {
-  appearance: none;
-  width: 12px;
-  height: 12px;
-  margin: 0;
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  background: transparent;
-  cursor: pointer;
-  position: relative;
+.settings input[type="number"] {
+  width: 4.6rem;
+  padding: 3px 6px;
 }
 
-.auto input:checked {
-  border-color: var(--c);
-  background: color-mix(in srgb, var(--c) 35%, transparent);
+.settings select {
+  padding: 3px 6px;
 }
 
-.auto input:checked::after {
-  content: "";
-  position: absolute;
-  left: 2.5px;
-  top: 0.5px;
-  width: 4px;
-  height: 7px;
-  border-right: 2px solid var(--c);
-  border-bottom: 2px solid var(--c);
-  transform: rotate(40deg);
+.metrics {
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 0.74rem;
+  color: var(--muted);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 0.5rem;
+  font-variant-numeric: tabular-nums;
 }
 
-.auto input:checked + span {
-  color: var(--c);
+.metrics .label {
+  color: #6f788a;
 }
 
-.row b {
-  color: #b9c8da;
-  font-family: var(--mono);
-  font-weight: 500;
-  /* "1.00 кГц" breaking into two lines reads as a different number. */
-  white-space: nowrap;
+.metrics .peak {
+  grid-column: 1 / -1;
+  color: #8a93a5;
 }
 
-.row.peak b {
-  color: #ffd68a;
+.metrics .sat {
+  grid-column: 1 / -1;
+  color: var(--warn);
 }
 
-@media (max-width: 1100px) {
+.trigger-state {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.trigger-state b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+@media (max-width: 1180px) {
   main {
-    grid-template-columns: 1fr 220px;
+    grid-template-columns: minmax(0, 1fr) 18rem;
   }
-  .cards {
-    grid-template-columns: 1fr;
+}
+
+@media (max-width: 900px) {
+  body {
+    overflow: auto;
+  }
+  main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  aside {
+    overflow: visible;
+  }
+  .plot-wrap {
+    min-height: 22rem;
   }
 }
