@@ -1,12 +1,13 @@
 //! Command line entry point.
 //!
 //! With no arguments this starts the program a person installs: the interface is
-//! baked into the executable, the browser opens by itself, and a missing
+//! baked into the executable, the mark is shown for two seconds and then the
+//! program opens in a window of its own — not a browser tab — and a missing
 //! instrument produces a window that says so rather than an error.
 //!
-//! `davinci info` checks the link, `davinci doctor` explains the whole chain,
-//! `--sim` swaps the hardware for a deterministic simulator so the UI and the
-//! logging path can be exercised on any machine.
+//! `davinci info` checks the link, `davinci doctor` explains the whole chain.
+//! There is no simulation mode: the program talks to the instrument or says why
+//! it cannot.
 
 mod app;
 mod assets;
@@ -15,6 +16,10 @@ mod engine;
 mod http;
 mod install;
 mod settings;
+// The native window. Only Windows has one; everywhere else the interface is
+// still served over HTTP and opened in a browser.
+#[cfg(windows)]
+mod window;
 
 use hantek1008::protocol::Measure;
 use hantek1008::{Device, Range, TimeDiv, CHANNELS};
@@ -47,8 +52,8 @@ fn main() {
             usage();
             0
         }
-        // `davinci --sim`, `davinci --port 7500`: a bare flag is still "run",
-        // not an unknown command.
+        // `davinci --port 7500`: a bare flag is still "run", not an unknown
+        // command.
         other if other.starts_with('-') && other != "-h" => app::run(&args),
         other => {
             eprintln!("неизвестная команда: {other}");
@@ -63,8 +68,7 @@ fn usage() {
     println!(
         "Осциллограф Хелтег да Винчи (Hantek 1008C) {version}
 
-  davinci                         запустить программу и интерфейс
-  davinci --sim                   то же на симуляторе, без прибора
+  davinci                         запустить программу в окне
   davinci doctor                  диагноз: прибор, драйвер, интерфейс, порт
   davinci driver status           что за драйвер сейчас владеет прибором
   davinci driver install          поставить WinUSB (нужен администратор)
@@ -76,7 +80,8 @@ fn usage() {
   davinci paths                   показать пути устройств WinUSB
 
   --port P    порт интерфейса (по умолчанию {port})
-  --no-open   не открывать браузер
+  --browser   открыть интерфейс в браузере вместо окна программы
+  --no-open   только интерфейс: ни окна, ни браузера (для отладки и MCP)
   --multi     разрешить второй экземпляр
 ",
         version = env!("CARGO_PKG_VERSION"),

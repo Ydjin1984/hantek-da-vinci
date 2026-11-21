@@ -1,0 +1,118 @@
+<!doctype html>
+<!--
+  The picture that shows while the program starts.
+
+  It is loaded into a frameless dark plate, so the mark is the only thing the
+  eye is asked to look at. `{{LOGO}}` is replaced with a data: URL of
+  `splash-logo.webp` at run time — the splash has to work before the interface
+  server is listening, so it carries its own picture.
+
+  The exit is driven from Rust: after two seconds the program adds the class
+  `gone` to <body>, the mark dissolves for half a second, and only then does
+  the plate go away.
+
+  One CSS trap is worth naming, because it silently broke this once: an
+  entrance animation with `fill-mode: both` keeps pinning opacity at its final
+  value forever, so a `transition` to zero on the same element never runs. The
+  animation therefore lives on #stage, and only the elements inside it fade.
+-->
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="dark" />
+    <title>Да Винчи</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #080b10;
+        overflow: hidden;
+      }
+
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: radial-gradient(120% 100% at 50% 38%, #151d27 0%, #0a0e14 58%, #070a0f 100%);
+        -webkit-user-select: none;
+        user-select: none;
+        cursor: default;
+      }
+
+      #stage {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 22px;
+        width: 84%;
+        animation: rise 0.55s cubic-bezier(0.22, 0.68, 0.24, 1) both;
+      }
+
+      #mark {
+        display: block;
+        width: 100%;
+        filter: drop-shadow(0 16px 42px rgba(0, 0, 0, 0.62));
+      }
+
+      #track {
+        width: 132px;
+        height: 2px;
+        border-radius: 2px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.09);
+      }
+
+      #track::after {
+        content: "";
+        display: block;
+        width: 46px;
+        height: 100%;
+        border-radius: 2px;
+        background: linear-gradient(90deg, rgba(255, 45, 45, 0), #ff2d2d, rgba(255, 45, 45, 0));
+        animation: sweep 1.15s ease-in-out infinite;
+      }
+
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(10px) scale(0.972);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+
+      @keyframes sweep {
+        0% {
+          transform: translateX(-52px);
+        }
+        100% {
+          transform: translateX(132px);
+        }
+      }
+
+      /* Fade-out: the picture dissolves, then the plate closes behind it. */
+      #mark,
+      #track {
+        transition: opacity 0.5s ease, transform 0.5s ease;
+      }
+
+      body.gone #mark {
+        opacity: 0;
+        transform: scale(1.015);
+      }
+
+      body.gone #track {
+        opacity: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <img id="mark" src="{{LOGO}}" alt="Да Винчи" />
+      <div id="track"></div>
+    </div>
+  </body>
+</html>

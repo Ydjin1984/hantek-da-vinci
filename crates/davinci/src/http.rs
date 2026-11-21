@@ -18,21 +18,34 @@ pub enum Assets {
     Dir(PathBuf),
 }
 
-pub fn serve(port: u16, assets: Assets, eng: EngineHandle) -> ! {
+/// Bind the interface and serve it from a thread of its own.
+///
+/// Binding happens here, on the caller's thread, so that a caller about to point
+/// a window at this URL knows the socket is already accepting — which is what
+/// lets the program show its window immediately instead of racing itself.
+pub fn start(port: u16, assets: Assets, eng: EngineHandle) -> Result<(), String> {
     let addr = format!("127.0.0.1:{port}");
-    let server = match Server::http(&addr) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("не удалось занять {addr}: {e}");
-            std::process::exit(1);
+    let server = Server::http(&addr).map_err(|e| format!("не удалось занять {addr}: {e}"))?;
+    std::thread::spawn(move || {
+        for request in server.incoming_requests() {
+            if let Err(e) = handle(request, &assets, &eng) {
+                eprintln!("http: {e}");
+            }
         }
-    };
-    for request in server.incoming_requests() {
-        if let Err(e) = handle(request, &assets, &eng) {
-            eprintln!("http: {e}");
-        }
+    });
+    Ok(())
+}
+
+/// Serve on this thread and never return — the shape used when there is no
+/// window (`--no-open`, `--browser`, or a system without one).
+pub fn serve(port: u16, assets: Assets, eng: EngineHandle) -> ! {
+    if let Err(e) = start(port, assets, eng) {
+        eprintln!("{e}");
+        std::process::exit(1);
     }
-    unreachable!()
+    loop {
+        std::thread::park();
+    }
 }
 
 fn handle(request: Request, assets: &Assets, eng: &EngineHandle) -> std::io::Result<()> {

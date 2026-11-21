@@ -187,6 +187,17 @@ function fmtSpan(s: number): string {
   return `${(s * 1e6).toFixed(0)} мкс`;
 }
 
+/**
+ * Seconds the drawn frame really covers, from the frame itself.
+ *
+ * Falls back to the requested span only before the first frame arrives, when
+ * there is nothing to measure yet.
+ */
+function drawnSpan(f: Frame | null): number {
+  if (!f || f.n === 0 || !(f.dtNs > 0)) return state.span;
+  return (f.n * f.dtNs) / 1e9;
+}
+
 // ---------------------------------------------------------------- data fetch
 
 async function fetchInfo() {
@@ -523,7 +534,13 @@ function draw() {
   ctx.fillStyle = "#5f7089";
   ctx.font = "500 10px ui-monospace, monospace";
   ctx.textAlign = "left";
-  ctx.fillText(`окно ${fmtSpan(state.span)} · деление ${fmtSpan(state.span / 10)}`, GUTTER, ry + 17);
+  // The window the screen really covers is the samples that reached the pixels:
+  // `n` of them, `dtNs` apart. The requested span is a wish, and the ADC's
+  // modelled ceiling is a guess — both drift from the data the moment the
+  // instrument cannot keep up (three channels, or a slow link), and the ruler
+  // then lies about the trace above it.
+  const real = drawnSpan(state.frame);
+  ctx.fillText(`окно ${fmtSpan(real)} · деление ${fmtSpan(real / 10)}`, GUTTER, ry + 17);
   ctx.textAlign = "right";
   ctx.fillText(state.running ? "захват идёт" : "остановлено", w - RIGHT, ry + 17);
 }

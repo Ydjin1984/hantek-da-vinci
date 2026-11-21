@@ -16,6 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 
+[build-dependencies]
+# Same icon file as the program itself: the installer is the first thing a
+# person sees, and a blank sheet in Explorer is not a good first impression.
+tauri-winres = "0.3"
+
 [profile.release]
 opt-level = "z"
 lto = true

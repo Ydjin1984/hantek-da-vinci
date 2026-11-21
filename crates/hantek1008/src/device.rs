@@ -81,7 +81,7 @@ impl Device {
         Err(Error::NoDevice)
     }
 
-    /// Wrap an arbitrary transport (used by tests and the simulator).
+    /// Wrap an arbitrary transport (used by tests).
     pub fn with_transport(io: Box<dyn Transport>) -> Device {
         Device {
             info: DeviceInfo { link: io.describe(), ..Default::default() },

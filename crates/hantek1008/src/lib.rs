@@ -28,8 +28,13 @@
 pub mod calib;
 pub mod device;
 pub mod protocol;
-pub mod sim;
 pub mod transport;
+
+// The deterministic simulator exists only for this crate's tests: it exercises
+// the demux and the engine without hardware. It is not compiled into anything
+// that ships, and no program mode can reach it.
+#[cfg(test)]
+pub mod sim;
 
 pub use calib::Calibration;
 pub use device::{Device, DeviceInfo};

@@ -468,12 +468,41 @@ impl EngineHandle {
                 let zero = g.calib.zero(range, ch);
                 let vpc = range.volt_per_count();
                 let mut volts: Vec<f32> = Vec::with_capacity(total);
+                // Amplitude wants every block; the period must not. Blocks are
+                // separated by a USB round trip of unknown length, so a stitched
+                // array has no single time base — the edges land on the joins and
+                // the reading collapses (a 500 Hz square came out as 6 Hz, and its
+                // duty as a meaningless 51%). One acquisition is one continuous
+                // window, so measure each block alone and keep the middle value.
+                let mut freqs: Vec<f32> = Vec::new();
+                let mut dutys: Vec<f32> = Vec::new();
                 for b in &blocks {
                     if let Some(raw) = &b.ch[ch] {
-                        volts.extend(raw.iter().map(|&v| (v as f32 - zero) * vpc));
+                        let block: Vec<f32> =
+                            raw.iter().map(|&v| (v as f32 - zero) * vpc).collect();
+                        let bm = Measure::of(&block, dt);
+                        if let Some(f) = bm.freq {
+                            freqs.push(f);
+                        }
+                        if let Some(d) = bm.duty {
+                            dutys.push(d);
+                        }
+                        volts.extend_from_slice(&block);
                     }
                 }
-                let m = if volts.is_empty() { None } else { Some(Measure::of(&volts, dt)) };
+                let mut m = if volts.is_empty() {
+                    None
+                } else {
+                    Some(Measure::of(&volts, dt))
+                };
+                if let Some(meas) = m.as_mut() {
+                    if let Some(f) = median(&mut freqs) {
+                        meas.freq = Some(f);
+                    }
+                    if let Some(d) = median(&mut dutys) {
+                        meas.duty = Some(d);
+                    }
+                }
                 let p = g.peaks[ch];
                 serde_json::json!({
                     "ch": ch + 1,
@@ -666,6 +695,18 @@ fn to_mv(v: f32) -> i16 {
     (v * 1000.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
+/// Middle value of a set, or `None` when it is empty.
+///
+/// Used to combine a measurement taken from each acquisition: one bad block
+/// (a truncated read, a phase that lands on an edge) must not move the reading.
+fn median(v: &mut [f32]) -> Option<f32> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
 fn ingest(g: &mut Inner, block: Block, reset: &AtomicBool) {
     let rate = if g.info_rate > 0.0 {
         g.info_rate
@@ -746,8 +787,8 @@ fn ingest(g: &mut Inner, block: Block, reset: &AtomicBool) {
 
 /// Sample rate implied by the time base and the number of enabled channels.
 ///
-/// `DAVINCI_FIXED_RATE` still wins, so replay and simulation numbers stay
-/// comparable across machines.
+/// `DAVINCI_FIXED_RATE` still wins, so replay numbers stay comparable across
+/// machines.
 fn implied_rate(params: &Params) -> f64 {
     let fixed = fixed_rate();
     if fixed > 0.0 {
@@ -756,8 +797,8 @@ fn implied_rate(params: &Params) -> f64 {
     params.time_div.sample_rate(params.enabled.len())
 }
 
-/// Time base override for simulation and replay: when set, the engine trusts it
-/// instead of measuring the link, so numbers stay comparable across machines.
+/// Time base override for replay: when set, the engine trusts it instead of
+/// measuring the link, so numbers stay comparable across machines.
 pub fn fixed_rate() -> f64 {
     std::env::var("DAVINCI_FIXED_RATE")
         .ok()

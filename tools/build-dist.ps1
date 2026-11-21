@@ -50,7 +50,7 @@ try {
         '{0,-28} {1,8:N0} КБ' -f $_.Name, ($_.Length / 1KB)
     }
     Write-Host ''
-    Write-Host 'Проверка без установки:  dist\DaVinci.exe --sim --no-open'
+    Write-Host 'Проверка без установки:  dist\DaVinci.exe doctor'
     Write-Host 'Установка:               dist\DaVinci-Setup.exe'
 }
 finally {

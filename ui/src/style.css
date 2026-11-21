@@ -1,4 +1,7 @@
 :root {
+  /* Native widgets follow this: scrollbars, the range dropdown, focus rings.
+     Without it WebView2 draws them in the system light theme on a black panel. */
+  color-scheme: dark;
   --bg: #080b10;
   --panel: #0c1117;
   --panel-2: #0f151d;
@@ -188,18 +191,30 @@ main {
 /* ----------------------------------------------------------------- cards */
 
 .cards {
-  flex: 0 0 268px;
+  flex: 0 0 330px;
   border-left: 1px solid var(--line);
   background: var(--panel);
   overflow-y: auto;
+  /* Setting one axis to auto makes the other auto as well, and half a pixel of
+     rounding then adds a horizontal scrollbar to a column that only ever needs
+     to scroll down. */
+  overflow-x: hidden;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   padding: 10px;
   align-content: start;
+  /* Eight cards do not fit in a window height by definition, so this column
+     scrolls — but a white system scrollbar on a black panel looks like a bug. */
+  scrollbar-width: thin;
+  scrollbar-color: #2a3646 transparent;
 }
 
 .card {
+  /* Grid items are as wide as their content by default, which quietly widened
+     this column past its 330 px and pushed the right-hand cards out of the
+     window. */
+  min-width: 0;
   border: 1px solid var(--line);
   border-left: 3px solid var(--c);
   border-radius: 8px;
@@ -322,6 +337,8 @@ select.range:focus {
   color: #b9c8da;
   font-family: var(--mono);
   font-weight: 500;
+  /* "1.00 кГц" breaking into two lines reads as a different number. */
+  white-space: nowrap;
 }
 
 .row.peak b {

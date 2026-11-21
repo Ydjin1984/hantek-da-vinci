@@ -1,17 +1,16 @@
-//! The entry point the user actually runs: no arguments, one window, one URL.
+//! The entry point the user actually runs: one window, one process, one URL.
 //!
 //! Responsibilities kept here (and nowhere else): single instance per machine,
-//! choosing a port, opening the browser, putting the state directory somewhere
-//! writable, and turning "no instrument" into a UI that says so instead of a
-//! console that dies. Acquisition stays in `engine`, HTTP in `http`.
+//! choosing a port, putting the state directory somewhere writable, and turning
+//! "no instrument" into a UI that says so instead of a console that dies.
+//! Acquisition stays in `engine`, HTTP in `http`, the native window in `window`.
 
-use crate::engine::Engine;
+use crate::engine::{Engine, EngineHandle};
 use crate::http::{self, Assets};
-use hantek1008::sim::SimTransport;
-use hantek1008::{Device, CHANNELS};
+use hantek1008::Device;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DEFAULT_PORT: u16 = 7411;
@@ -114,8 +113,8 @@ fn has(args: &[String], flag: &str) -> bool {
 
 /// Start the whole program. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
-    let sim = has(args, "--sim");
-    let no_open = has(args, "--no-open");
+    let headless = has(args, "--no-open");
+    let browser = has(args, "--browser");
     let ui_dir = crate::arg_value(args, "--ui").map(PathBuf::from);
     let want: u16 = crate::arg_value(args, "--port")
         .and_then(|v| v.parse().ok())
@@ -126,8 +125,8 @@ pub fn run(args: &[String]) -> i32 {
         if let Some(port) = probe_running() {
             let url = format!("http://127.0.0.1:{port}/");
             println!("{APP_NAME} уже запущен: {url}");
-            if !no_open {
-                open_browser(&url);
+            if !headless && !show_existing(&url, browser) {
+                println!("окно не найдено — откройте {url} вручную");
             }
             return 0;
         }
@@ -146,30 +145,123 @@ pub fn run(args: &[String]) -> i32 {
         None => Assets::Embedded,
     };
 
-    banner(port, sim, &assets, &state);
+    banner(port, &assets, &state);
 
-    let device = if sim {
-        println!("режим симулятора: железо не используется");
-        std::env::set_var("DAVINCI_FIXED_RATE", "50000");
-        Some(sim_device())
-    } else {
-        open_hardware()
-    };
+    // A window needs the main thread for its event loop, so the instrument and
+    // the interface server move to a thread and the picture appears at once.
+    // `--no-open` (interface only) and `--browser` (a page instead of a window)
+    // keep the old shape and stay useful for development.
+    #[cfg(windows)]
+    {
+        if !headless && !browser {
+            return run_windowed(state, assets, port);
+        }
+    }
 
-    let eng = match device {
+    let eng = start_engine(&state);
+    let url = format!("http://127.0.0.1:{port}/");
+    println!("\nинтерфейс: {url}");
+    println!("остановить: Ctrl+C\n");
+    if browser && !headless {
+        open_browser(&url);
+    }
+
+    http::serve(port, assets, eng)
+}
+
+/// Bring the running copy forward instead of starting a second one.
+fn show_existing(url: &str, browser: bool) -> bool {
+    #[cfg(windows)]
+    {
+        if crate::window::raise_existing() {
+            return true;
+        }
+    }
+    if browser {
+        open_browser(url);
+        return true;
+    }
+    false
+}
+
+/// The program as a window: the mark for two seconds, then the interface.
+///
+/// The worker thread does everything that used to happen before the interface
+/// was served, and reports when the socket is listening — the window loads that
+/// address the instant it is created, so "ready" must mean ready.
+#[cfg(windows)]
+fn run_windowed(state: PathBuf, assets: Assets, port: u16) -> i32 {
+    use tao::event_loop::EventLoopBuilder;
+
+    // Started from Explorer or a shortcut we own a console nobody asked for;
+    // it would sit behind the window as a black rectangle all session.
+    hide_console();
+
+    let mut builder = EventLoopBuilder::<crate::window::Msg>::with_user_event();
+    let event_loop = builder.build();
+    let proxy = event_loop.create_proxy();
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let worker = proxy.clone();
+    std::thread::spawn(move || {
+        let eng = start_engine(&state);
+        if let Err(e) = http::start(port, assets, eng) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        let _ = worker.send_event(crate::window::Msg::Ready);
+    });
+
+    crate::window::run(event_loop, proxy, url)
+}
+
+/// Hide the console window, but only if it is ours.
+///
+/// Launched from a terminal the console belongs to the person typing, and
+/// hiding it would take their window away. `GetConsoleProcessList` answers
+/// "how many processes are attached": one means the console was created for
+/// this process alone.
+#[cfg(windows)]
+fn hide_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(window: *mut std::ffi::c_void, cmd: i32) -> i32;
+    }
+    const SW_HIDE: i32 = 0;
+    unsafe {
+        let console = GetConsoleWindow();
+        if console.is_null() {
+            return;
+        }
+        let mut attached = [0u32; 2];
+        let processes = GetConsoleProcessList(attached.as_mut_ptr(), 2);
+        if processes > 1 {
+            crate::window::trace(&format!("console: shared with {processes}, left alone"));
+            return;
+        }
+        let was_visible = ShowWindow(console, SW_HIDE);
+        crate::window::trace(&format!("console: hidden, previous state {was_visible}"));
+    }
+}
+
+/// Instrument, engine thread, and the settings the previous run left behind.
+///
+/// Runs on a worker thread in window mode and on the main thread otherwise; it
+/// never touches the window, which is why it can be either.
+fn start_engine(state: &Path) -> EngineHandle {
+    match open_hardware() {
         Some(mut dev) => {
-            if !sim {
-                match dev.measure_rate(8) {
-                    Ok(i) => println!(
-                        "частота: {:.0} Гц/канал, {} сэмплов в блоке, {:.0} блоков/с",
-                        i.sample_rate, i.block_samples, i.blocks_per_s
-                    ),
-                    Err(e) => eprintln!("частота не измерена: {e}"),
-                }
-            } else {
-                dev.info.sample_rate = 50_000.0;
-                dev.info.block_samples = 500;
-                dev.info.blocks_per_s = 100.0;
+            match dev.measure_rate(8) {
+                Ok(i) => println!(
+                    "частота: {:.0} Гц/канал, {} сэмплов в блоке, {:.0} блоков/с",
+                    i.sample_rate, i.block_samples, i.blocks_per_s
+                ),
+                Err(e) => eprintln!("частота не измерена: {e}"),
             }
 
             let calib_path = state.join("calibration.json");
@@ -203,23 +295,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("\n{reason}\nинтерфейс всё равно откроется — в нём видно состояние связи.");
             Engine::offline(link, reason).handle()
         }
-    };
-
-    let url = format!("http://127.0.0.1:{port}/");
-    println!("\nинтерфейс: {url}");
-    println!("остановить: Ctrl+C\n");
-    if !no_open {
-        open_browser(&url);
     }
-
-    http::serve(port, assets, eng)
-}
-
-fn sim_device() -> Device {
-    let mut d = Device::with_transport(Box::new(SimTransport::new()));
-    d.set_channels(&(0..CHANNELS).collect::<Vec<_>>()).unwrap();
-    d.info.link = "simulator".into();
-    d
 }
 
 fn open_hardware() -> Option<Device> {
@@ -232,7 +308,7 @@ fn open_hardware() -> Option<Device> {
             }
             let st = crate::driver::status();
             if !st.found {
-                eprintln!("подсказка: подключите прибор по USB. Без него доступен режим --sim.");
+                eprintln!("подсказка: прибор не найден. Подключите его по USB и запустите программу заново.");
                 return None;
             }
             eprintln!("{}", st.summary());
@@ -264,7 +340,7 @@ fn offer_driver_install() -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes" | "д" | "да")
 }
 
-fn banner(port: u16, sim: bool, assets: &Assets, state: &std::path::Path) {
+fn banner(port: u16, assets: &Assets, state: &std::path::Path) {
     println!();
     println!("  {APP_NAME} {}", env!("CARGO_PKG_VERSION"));
     println!("  ─────────────────────────────────────────────");
@@ -278,12 +354,8 @@ fn banner(port: u16, sim: bool, assets: &Assets, state: &std::path::Path) {
     }
     println!("  адрес:     http://127.0.0.1:{port}/");
     println!("  состояние: {}", state.display());
-    if sim {
-        println!("  прибор:    симулятор");
-    } else {
-        let st = crate::driver::status();
-        println!("  прибор:    {}", st.summary());
-    }
+    let st = crate::driver::status();
+    println!("  прибор:    {}", st.summary());
 }
 
 /// `davinci doctor` — the whole chain in one report.

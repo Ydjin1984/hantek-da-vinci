@@ -13,6 +13,8 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let target = out_dir.join("payload.exe");
 
+    icon(&manifest);
+
     let root = manifest.join("../..");
     let candidates = [
         root.join("target/release/davinci.exe"),
@@ -42,5 +44,29 @@ fn main() {
         // run with it and says exactly what to build first.
         std::fs::write(&target, b"\0\0\0\0").expect("write placeholder payload");
         println!("cargo:warning=НЕТ ПРОГРАММЫ: сначала cargo build --release -p davinci");
+    }
+}
+
+/// The icon and the version strings, straight from the program's own artwork.
+fn icon(manifest: &std::path::Path) {
+    let ico = manifest.join("../../crates/davinci/assets/davinci.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+    if !ico.exists() {
+        println!("cargo:warning=нет {}: установщик останется без иконки", ico.display());
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let mut res = tauri_winres::WindowsResource::new();
+        res.set_icon(ico.to_string_lossy().as_ref());
+        res.set("FileDescription", "Установщик «Осциллограф Хелтег да Винчи»");
+        res.set("ProductName", "DaVinci Oscilloscope");
+        res.set("CompanyName", "DaVinci Cyber Engineering");
+        res.set("LegalCopyright", "MIT");
+        res.set("OriginalFilename", "DaVinci-Setup.exe");
+        match res.compile() {
+            Ok(()) => {}
+            Err(e) => println!("cargo:warning=ресурсы установщика не собраны: {e}"),
+        }
     }
 }

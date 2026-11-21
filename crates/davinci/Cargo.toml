@@ -14,3 +14,17 @@ hantek1008 = { path = "../hantek1008" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
+
+# The program is a window, not a browser tab. `tao` owns the native window and
+# the event loop, `wry` puts WebView2 inside it; the Rust side keeps working
+# exactly as before, because the interface still talks to 127.0.0.1.
+[target.'cfg(windows)'.dependencies]
+tao = "0.37"
+wry = "0.57"
+
+# Icon and version resource for the .exe (so Explorer, the taskbar and the
+# properties dialog know what this file is), plus the ICO reader that turns the
+# same icon into the RGBA the window wants at run time.
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres = "0.3"
+ico = "0.6"
