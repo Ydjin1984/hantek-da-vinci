@@ -21,6 +21,9 @@ tiny_http = "0.12"
 [target.'cfg(windows)'.dependencies]
 tao = "0.37"
 wry = "0.57"
+# Only for the WebView2 `ProcessFailed` event: a dead renderer must reload, not
+# leave the last painted frame on screen. wry does not re-export it.
+webview2-com = "0.39"
 
 # Icon and version resource for the .exe (so Explorer, the taskbar and the
 # properties dialog know what this file is), plus the ICO reader that turns the

@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "davinci"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "hantek1008",
  "ico",
@@ -306,6 +306,7 @@ dependencies = [
  "tao",
  "tauri-winres",
  "tiny_http",
+ "webview2-com",
  "wry",
 ]
 
@@ -889,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "hantek1008"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",

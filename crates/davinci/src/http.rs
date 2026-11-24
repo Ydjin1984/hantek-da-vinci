@@ -18,6 +18,8 @@ use crate::engine::EngineHandle;
 use crate::trigger::{self, Config as TriggerConfig};
 use hantek1008::{Range, TimeDiv};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Where the interface comes from.
@@ -34,11 +36,20 @@ pub enum Assets {
 /// Binding happens here, on the caller's thread, so that a caller about to point
 /// a window at this URL knows the socket is already accepting — which is what
 /// lets the program show its window immediately instead of racing itself.
-pub fn start(port: u16, assets: Assets, eng: EngineHandle) -> Result<(), String> {
+pub fn start(
+    port: u16,
+    assets: Assets,
+    eng: EngineHandle,
+    ui_beat: Arc<AtomicU64>,
+) -> Result<(), String> {
     let addr = format!("127.0.0.1:{port}");
     let server = Server::http(&addr).map_err(|e| format!("не удалось занять {addr}: {e}"))?;
     std::thread::spawn(move || {
         for request in server.incoming_requests() {
+            // A page that is still alive keeps making requests. The window's
+            // native watchdog watches this counter: a frozen renderer stops it,
+            // and only a reload brings the picture back.
+            ui_beat.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = handle(request, &assets, &eng) {
                 eprintln!("http: {e}");
             }
@@ -50,7 +61,7 @@ pub fn start(port: u16, assets: Assets, eng: EngineHandle) -> Result<(), String>
 /// Serve on this thread and never return — the shape used when there is no
 /// window (`--no-open`, `--browser`, or a system without one).
 pub fn serve(port: u16, assets: Assets, eng: EngineHandle) -> ! {
-    if let Err(e) = start(port, assets, eng) {
+    if let Err(e) = start(port, assets, eng, Arc::new(AtomicU64::new(0))) {
         eprintln!("{e}");
         std::process::exit(1);
     }
@@ -69,7 +80,7 @@ fn handle(mut request: Request, assets: &Assets, eng: &EngineHandle) -> std::io:
     let is_post = request.method() == &Method::Post;
     let writable = matches!(
         path.as_str(),
-        "/api/trigger" | "/api/trigger/arm" | "/api/hold" | "/api/control"
+        "/api/trigger" | "/api/trigger/arm" | "/api/hold" | "/api/control" | "/api/link/reconnect"
     );
     if is_post && !writable {
         return request.respond(Response::empty(405));
@@ -139,8 +150,17 @@ fn handle(mut request: Request, assets: &Assets, eng: &EngineHandle) -> std::io:
                     "path": st.log_path,
                     "bytes": st.log_bytes,
                     "seconds": st.log_seconds,
+                    "error": st.log_error,
                 },
                 "blocks_total": st.blocks_total,
+                // Link health, in the same answer as the numbers: the UI can
+                // tell "Single holds a capture" from "the instrument stopped
+                // answering" without a second request.
+                "link_state": st.link_state,
+                "frame_age_ms": st.frame_age_ms,
+                "last_block_age_ms": st.last_block_age_ms,
+                "consecutive_errors": st.consecutive_errors,
+                "reopen_attempts": st.reopen_attempts,
             });
             json(request, &body.to_string())
         }
@@ -267,6 +287,22 @@ fn handle(mut request: Request, assets: &Assets, eng: &EngineHandle) -> std::io:
             json(
                 request,
                 &serde_json::json!({"ok": true, "held": st.held, "frame_id": st.frame_id}).to_string(),
+            )
+        }
+
+        // Drop the USB handle and open the instrument again. For a handle that
+        // stopped answering, and for the "Переподключить" button.
+        "/api/link/reconnect" => {
+            eng.reconnect();
+            let st = eng.status();
+            json(
+                request,
+                &serde_json::json!({
+                    "ok": true,
+                    "link_state": st.link_state,
+                    "reopen_attempts": st.reopen_attempts,
+                })
+                .to_string(),
             )
         }
 

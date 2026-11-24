@@ -14,6 +14,7 @@
 use crate::trigger::Config;
 use hantek1008::protocol::Measure;
 use hantek1008::CHANNELS;
+use std::time::Instant;
 
 /// Fewer samples than this per period of the measured signal and the trace on
 /// screen is an alias of the waveform, not the waveform. Four is the usual
@@ -70,6 +71,9 @@ fn jump_fraction(samples: &[f32]) -> f64 {
 #[derive(Debug)]
 pub struct Snapshot {
     pub id: u64,
+    /// When this frame was published. The status uses it to say how old the
+    /// picture on screen is; comparing frame ids cannot answer that.
+    pub created_at: Instant,
     /// Configuration generation this frame was acquired under.
     pub generation: u64,
     pub dt_s: f64,
@@ -425,6 +429,7 @@ mod tests {
     fn snapshot(channels: Vec<usize>, samples: Vec<Vec<f32>>, len: f64) -> Snapshot {
         Snapshot {
             id: 42,
+            created_at: Instant::now(),
             generation: 3,
             dt_s: 1.0 / 50_000.0,
             channels,

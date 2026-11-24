@@ -30,6 +30,49 @@ const LEVEL_RESCUE_MS: u64 = 400;
 /// After the user sets the level, the rescue keeps its hands off for this long.
 const LEVEL_USER_GRACE_MS: u64 = 2500;
 
+/// Consecutive read/apply failures before the USB handle is thrown away.
+///
+/// A handle that has seen the device re-enumerate (sleep, hub power management,
+/// cable) never works again: every read fails with the same error for ever.
+/// Reopening is the only cure, and the program has to do it itself — the user
+/// should not have to restart the window.
+const FAILURES_BEFORE_REOPEN: u32 = 3;
+
+/// First and longest pause between attempts to reopen a missing instrument.
+const RECONNECT_MIN_MS: u64 = 500;
+const RECONNECT_MAX_MS: u64 = 15_000;
+
+/// How long one reopen attempt waits for the device to enumerate.
+const RECONNECT_OPEN_MS: u64 = 1_200;
+
+/// No block for this long means the acquisition is not delivering data, even if
+/// the last block rate is still in the structure. The UI must show zero, not a
+/// frozen lie.
+const DATA_STALE_MS: u64 = 1_500;
+
+/// One DAV file stops growing here. A night at three channels is ~70 KB/s, so
+/// this is many hours; the point is that a forgotten recording cannot fill the
+/// system disk. Stopping is reported in the status instead of happening silently.
+const LOG_MAX_BYTES: u64 = 1 << 30;
+
+/// Whether the USB link is delivering, being reopened, or absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    Live,
+    Reconnecting,
+    Offline,
+}
+
+impl LinkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkState::Live => "live",
+            LinkState::Reconnecting => "reconnecting",
+            LinkState::Offline => "offline",
+        }
+    }
+}
+
 /// Live parameters, changed from the UI while acquisition runs.
 #[derive(Debug, Clone)]
 pub struct Params {
@@ -123,6 +166,22 @@ pub struct Status {
     pub source_span: Option<(f32, f32)>,
     /// Set for a while after the engine moved a level no edge could ever reach.
     pub level_rescue: Option<LevelRescueInfo>,
+    /// `live`, `reconnecting` or `offline`: whether the USB link is delivering,
+    /// being reopened, or absent.
+    pub link_state: &'static str,
+    /// Age of the frame the screen is showing, held frame included. This is what
+    /// tells "Single holds a capture" apart from "the picture died".
+    pub frame_age_ms: Option<u64>,
+    /// Age of the newest block. Grows while the device is silent; the UI turns
+    /// this into "нет данных N с".
+    pub last_block_age_ms: Option<u64>,
+    /// Failures since the last good block.
+    pub consecutive_errors: u32,
+    /// Reopen attempts in the current outage.
+    pub reopen_attempts: u32,
+    /// Why recording stopped, when it stopped by itself (size limit or a write
+    /// error). `None` while recording is healthy or was never started.
+    pub log_error: Option<String>,
 }
 
 /// What the engine did, and what it saw, when it had to move an unreachable level.
@@ -176,6 +235,17 @@ struct Inner {
     level_rescue: Option<LevelRescue>,
     /// Extremes of the trigger source in the latest block, in volts.
     source_span: Option<(f32, f32)>,
+    /// Link health, reported to the UI so "no data" is never mistaken for
+    /// "waiting for a trigger".
+    link_state: LinkState,
+    /// When the last block was ingested. `None` until the first one.
+    last_block_at: Option<Instant>,
+    /// Consecutive failures since the last good block.
+    consecutive_errors: u32,
+    /// Reopen attempts in the current outage.
+    reopen_attempts: u32,
+    /// Why recording stopped by itself, if it did.
+    log_error: Option<String>,
 }
 
 /// A trace the engine wrote when it moved a level the signal could not reach.
@@ -221,6 +291,9 @@ pub struct Engine {
     inner: Arc<Mutex<Inner>>,
     running: Arc<AtomicBool>,
     reset_peaks: Arc<AtomicBool>,
+    /// Set by the UI's "Переподключить" button; the supervisor drops the handle
+    /// and opens the instrument again.
+    reconnect: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -265,17 +338,24 @@ impl Engine {
                 level_set_at: None,
                 level_rescue: None,
                 source_span: None,
+                link_state: LinkState::Live,
+                last_block_at: None,
+                consecutive_errors: 0,
+                reopen_attempts: 0,
+                log_error: None,
             })),
             running: Arc::new(AtomicBool::new(true)),
             reset_peaks: Arc::new(AtomicBool::new(false)),
+            reconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// An engine for a program that has no instrument (yet).
     ///
-    /// It never produces samples: the status carries the reason and `run` is
-    /// simply not called. This exists so the window opens and explains itself
-    /// instead of the process exiting on a missing cable.
+    /// It never produces samples until the supervisor manages to open the
+    /// instrument, but it *does* keep trying: plugging the cable back in or
+    /// waking the machine must not require restarting the window. `run` is
+    /// spawned with `None` for exactly this case.
     pub fn offline(link: String, error: String) -> Engine {
         Engine {
             inner: Arc::new(Mutex::new(Inner {
@@ -305,9 +385,15 @@ impl Engine {
                 level_set_at: None,
                 level_rescue: None,
                 source_span: None,
+                link_state: LinkState::Offline,
+                last_block_at: None,
+                consecutive_errors: 0,
+                reopen_attempts: 0,
+                log_error: None,
             })),
-            running: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(true)),
             reset_peaks: Arc::new(AtomicBool::new(false)),
+            reconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -316,41 +402,120 @@ impl Engine {
             inner: Arc::clone(&self.inner),
             running: Arc::clone(&self.running),
             reset_peaks: Arc::clone(&self.reset_peaks),
+            reconnect: Arc::clone(&self.reconnect),
         }
     }
 
     /// Run the acquisition loop forever on the current thread.
-    pub fn run(self, mut dev: Device) -> ! {
-        let mut applied = Params {
-            enabled: dev.enabled.clone(),
-            ranges: dev.ranges,
-            range_v: dev.ranges.map(|r| r.full_scale()),
-            time_div: dev.time_div,
-            autoscale: [false; CHANNELS],
-            center_v: [0.0; CHANNELS],
-            trigger: TriggerConfig::default(),
-        };
+    ///
+    /// `dev` is `None` when the program started without an instrument: the
+    /// supervisor then keeps trying to open one instead of staying dead until a
+    /// restart. The same loop owns recovery from a USB handle that stopped
+    /// answering (sleep, re-enumeration, hub power management).
+    pub fn run(self, mut dev: Option<Device>) -> ! {
+        let mut applied: Option<Applied> = None;
         let mut last_rate_check = Instant::now();
         let mut blocks_at_check = 0u64;
+        let mut failures = 0u32;
+        let mut backoff_ms = RECONNECT_MIN_MS;
+
         loop {
+            // An explicit request from the UI: drop the handle and open again.
+            if self.reconnect.swap(false, Ordering::Relaxed) {
+                dev = None;
+                applied = None;
+                failures = 0;
+                let mut g = self.inner.lock().unwrap();
+                g.link_state = LinkState::Reconnecting;
+                g.error = Some("переподключение по запросу".into());
+                g.waiting_since = None;
+                crate::diag::log("link: переподключение по запросу");
+            }
+
+            // No instrument: a state, not the end of the program. Try again with
+            // a growing pause, so a missing cable or a re-enumerating device is
+            // picked up without a restart.
+            if dev.is_none() {
+                {
+                    let mut g = self.inner.lock().unwrap();
+                    g.link_state = LinkState::Reconnecting;
+                    if g.error.is_none() {
+                        g.error = Some("прибор не найден — ищу…".into());
+                    }
+                }
+                match open_device(RECONNECT_OPEN_MS) {
+                    Ok(mut d) => {
+                        applied = None;
+                        failures = 0;
+                        backoff_ms = RECONNECT_MIN_MS;
+                        let calib = self.inner.lock().unwrap().calib.clone();
+                        d.calib = calib;
+                        let link = d.info.link.clone();
+                        dev = Some(d);
+                        let mut g = self.inner.lock().unwrap();
+                        g.link = link;
+                        g.link_state = LinkState::Live;
+                        g.error = None;
+                        g.consecutive_errors = 0;
+                        g.reopen_attempts = 0;
+                        g.generation += 1;
+                        g.waiting_since = None;
+                        last_rate_check = Instant::now();
+                        blocks_at_check = g.blocks_total;
+                        drop(g);
+                        crate::diag::log("link: прибор открыт");
+                    }
+                    Err(e) => {
+                        let mut g = self.inner.lock().unwrap();
+                        g.link_state = LinkState::Offline;
+                        g.error = Some(format!("прибор не открывается: {e}"));
+                        g.consecutive_errors = g.consecutive_errors.saturating_add(1);
+                        g.reopen_attempts = g.reopen_attempts.saturating_add(1);
+                        drop(g);
+                        crate::diag::log(&format!("link: открыть не удалось: {e}"));
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
+                        backoff_ms = (backoff_ms * 2).min(RECONNECT_MAX_MS);
+                        continue;
+                    }
+                }
+            }
+
+            if !self.running.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+                // Idle: keep the device alive without acquiring. A dead handle is
+                // still a dead handle, so the same failure counter decides when
+                // to reopen it.
+                let ping = dev.as_mut().expect("device checked above").ping();
+                match ping {
+                    Ok(()) => self.link_ok(),
+                    Err(e) => {
+                        self.link_error(&e.to_string(), &mut failures);
+                        if failures >= FAILURES_BEFORE_REOPEN {
+                            dev = None;
+                            applied = None;
+                            failures = 0;
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Push user changes down to the hardware before acquiring again.
             let want = { self.inner.lock().unwrap().params.clone() };
-            let mut touched = false;
-            if want.enabled != applied.enabled {
-                let _ = dev.set_channels(&want.enabled);
-                applied.enabled = want.enabled.clone();
-                touched = true;
-            }
-            if want.ranges != applied.ranges {
-                let _ = dev.set_ranges(&want.ranges);
-                applied.ranges = want.ranges;
-                touched = true;
-            }
-            if want.time_div.id != applied.time_div.id {
-                let _ = dev.set_time_div(want.time_div);
-                applied.time_div = want.time_div;
-                touched = true;
-            }
+            let touched = match apply_params(dev.as_mut().expect("device checked above"), &want, &mut applied) {
+                Ok(changed) => changed,
+                Err(e) => {
+                    self.link_error(&e, &mut failures);
+                    if failures >= FAILURES_BEFORE_REOPEN {
+                        crate::diag::log(&format!("link: настройка не прошла ({e}) — переоткрываю"));
+                        dev = None;
+                        applied = None;
+                        failures = 0;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            };
 
             // The time axis is defined by the time base and the number of
             // channels, not by how fast USB happens to deliver blocks: the device
@@ -370,13 +535,6 @@ impl Engine {
                 }
             }
 
-            if !self.running.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(20));
-                // Idle: keep the device alive without acquiring.
-                let _ = dev.ping();
-                continue;
-            }
-
             // Pin the settings this read will be interpreted with, before the
             // read: the user may change the range while USB is in flight, and the
             // block that comes back belongs to the settings it was asked for.
@@ -385,13 +543,23 @@ impl Engine {
                 (g.params.clone(), g.generation, g.arm_seq)
             };
 
-            match dev.read_block() {
+            let read = dev.as_mut().expect("device checked above").read_block();
+            match read {
                 Ok(block) => {
                     let n = block.n;
+                    failures = 0;
+                    backoff_ms = RECONNECT_MIN_MS;
                     let elapsed = {
                         let mut g = self.inner.lock().unwrap();
                         ingest(&mut g, block, &self.reset_peaks, &pinned, generation, rate, arm_seq);
                         g.blocks_total += 1;
+                        g.last_block_at = Some(Instant::now());
+                        // A successful block is the only proof the link is alive.
+                        // Clearing this here is what stops one transient timeout
+                        // from keeping "нет связи" on screen for the session.
+                        g.error = None;
+                        g.consecutive_errors = 0;
+                        g.link_state = LinkState::Live;
                         g.blocks_total
                     };
                     if last_rate_check.elapsed() >= Duration::from_secs(1) {
@@ -409,14 +577,98 @@ impl Engine {
                     }
                 }
                 Err(e) => {
-                    let mut g = self.inner.lock().unwrap();
-                    g.error = Some(e.to_string());
-                    drop(g);
+                    self.link_error(&e.to_string(), &mut failures);
+                    if failures >= FAILURES_BEFORE_REOPEN {
+                        crate::diag::log(&format!(
+                            "link: {FAILURES_BEFORE_REOPEN} ошибки подряд ({e}) — переоткрываю прибор"
+                        ));
+                        dev = None;
+                        applied = None;
+                        failures = 0;
+                        let mut g = self.inner.lock().unwrap();
+                        g.link_state = LinkState::Reconnecting;
+                        g.waiting_since = None;
+                    }
                     std::thread::sleep(Duration::from_millis(200));
                 }
             }
         }
     }
+
+    /// Record one failed read/apply without holding the lock across sleeps.
+    fn link_error(&self, message: &str, failures: &mut u32) {
+        *failures = failures.saturating_add(1);
+        let mut g = self.inner.lock().unwrap();
+        let first = g.consecutive_errors == 0;
+        g.error = Some(message.to_string());
+        g.consecutive_errors = g.consecutive_errors.saturating_add(1);
+        if *failures >= FAILURES_BEFORE_REOPEN {
+            g.link_state = LinkState::Reconnecting;
+        }
+        drop(g);
+        if first {
+            crate::diag::log(&format!("link: ошибка чтения: {message}"));
+        }
+    }
+
+    /// A successful read or ping: the link is healthy, forget the failure.
+    fn link_ok(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.error.is_some() || g.link_state != LinkState::Live {
+            g.error = None;
+            g.consecutive_errors = 0;
+            g.link_state = LinkState::Live;
+            drop(g);
+            crate::diag::log("link: связь восстановлена");
+        }
+    }
+}
+
+/// Parameters actually accepted by the device.
+///
+/// Kept separate from [`Params`] so a failed command is never recorded as
+/// applied: the next loop retries it instead of believing a range change that
+/// the instrument rejected.
+struct Applied {
+    enabled: Vec<usize>,
+    ranges: [Range; CHANNELS],
+    time_div: TimeDiv,
+}
+
+/// Send the differences to the device; return whether anything changed.
+fn apply_params(
+    dev: &mut Device,
+    want: &Params,
+    applied: &mut Option<Applied>,
+) -> Result<bool, String> {
+    let fresh = applied.is_none();
+    let mut touched = false;
+    if fresh || applied.as_ref().map(|a| a.enabled != want.enabled).unwrap_or(true) {
+        dev.set_channels(&want.enabled).map_err(|e| e.to_string())?;
+        touched = true;
+    }
+    if fresh || applied.as_ref().map(|a| a.ranges != want.ranges).unwrap_or(true) {
+        dev.set_ranges(&want.ranges).map_err(|e| e.to_string())?;
+        touched = true;
+    }
+    if fresh || applied.as_ref().map(|a| a.time_div.id != want.time_div.id).unwrap_or(true) {
+        dev.set_time_div(want.time_div).map_err(|e| e.to_string())?;
+        touched = true;
+    }
+    *applied = Some(Applied {
+        enabled: want.enabled.clone(),
+        ranges: want.ranges,
+        time_div: want.time_div,
+    });
+    Ok(touched)
+}
+
+/// Open and initialise an instrument for the supervisor.
+fn open_device(timeout_ms: u64) -> Result<Device, String> {
+    let mut dev = Device::open_within(Duration::from_millis(timeout_ms))
+        .map_err(|e| e.to_string())?;
+    dev.init().map_err(|e| e.to_string())?;
+    Ok(dev)
 }
 
 /// Cheap clonable control surface used by the HTTP layer.
@@ -425,6 +677,7 @@ pub struct EngineHandle {
     inner: Arc<Mutex<Inner>>,
     running: Arc<AtomicBool>,
     reset_peaks: Arc<AtomicBool>,
+    reconnect: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
@@ -451,6 +704,18 @@ impl EngineHandle {
 
     pub fn reset_peaks(&self) {
         self.reset_peaks.store(true, Ordering::Relaxed);
+    }
+
+    /// Ask the supervisor to drop the USB handle and open the instrument again.
+    ///
+    /// For a handle that stopped answering, and for a user who suspects the
+    /// link: the program no longer needs to be restarted to get the device back.
+    pub fn reconnect(&self) {
+        self.reconnect.store(true, Ordering::Relaxed);
+        let mut g = self.inner.lock().unwrap();
+        g.link_state = LinkState::Reconnecting;
+        g.error = Some("переподключение по запросу".into());
+        g.waiting_since = None;
     }
 
     pub fn set_channels(&self, chans: Vec<usize>) {
@@ -696,42 +961,7 @@ impl EngineHandle {
 
     pub fn status(&self) -> Status {
         let g = self.inner.lock().unwrap();
-        Status {
-            running: self.running.load(Ordering::Relaxed),
-            link: g.link.clone(),
-            sample_rate: g.info_rate,
-            block_samples: g.block_samples,
-            blocks_per_s: g.blocks_per_s,
-            time_div: g.params.time_div.label(),
-            time_div_id: g.params.time_div.id,
-            window_s: g.params.time_div.real_window_s(g.params.enabled.len().max(1)),
-            window_clamped: {
-                let n = g.params.enabled.len().max(1);
-                g.params.time_div.real_window_s(n) > g.params.time_div.window_s() * 1.02
-            },
-            error: g.error.clone(),
-            state: g.state.as_str().to_string(),
-            frame_id: g.held.as_ref().or(g.last.as_ref()).map(|s| s.id).unwrap_or(0),
-            held: g.held.is_some(),
-            rec: g.log.is_some(),
-            trigger: g.params.trigger.clone(),
-            source_span: g.source_span,
-            level_rescue: g
-                .level_rescue
-                .map(|r| LevelRescueInfo {
-                    min_v: r.min_v,
-                    max_v: r.max_v,
-                    level_v: r.level_v,
-                    age_ms: r.at.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                })
-                // An old move is history, not a message: the panel must not keep
-                // explaining something that happened a minute ago.
-                .filter(|r| r.age_ms < 15_000),
-            log_path: g.log.as_ref().map(|l| l.path.display().to_string()),
-            log_bytes: g.log.as_ref().map(|l| l.bytes).unwrap_or(0),
-            log_seconds: g.log.as_ref().map(|l| l.started_at.elapsed().as_secs_f64()).unwrap_or(0.0),
-            blocks_total: g.blocks_total,
-        }
+        status_from(&g, self.running.load(Ordering::Relaxed))
     }
 
     /// Per-channel statistics as JSON-ready values.
@@ -911,10 +1141,11 @@ impl EngineHandle {
         g.log = Some(LogState {
             path,
             writer: w,
-            bytes: 0,
+            bytes: (8 + 4 + head.len()) as u64,
             since_fsync: 0,
             started_at: Instant::now(),
         });
+        g.log_error = None;
         Ok(())
     }
 
@@ -924,6 +1155,61 @@ impl EngineHandle {
             let _ = l.writer.flush();
             let _ = l.writer.get_ref().sync_all();
         }
+    }
+}
+
+/// Public status derived from the engine's state.
+///
+/// Kept out of [`EngineHandle`] so the staleness rules are testable without a
+/// device thread: a rate that is no longer being fed must read as zero, and the
+/// age of the shown frame must always be available.
+fn status_from(g: &Inner, running: bool) -> Status {
+    let stale = g
+        .last_block_at
+        .map_or(true, |t| t.elapsed() >= Duration::from_millis(DATA_STALE_MS));
+    let shown = g.held.as_ref().or(g.last.as_ref());
+    let age_ms = |d: Duration| d.as_millis().min(u64::MAX as u128) as u64;
+    Status {
+        running,
+        link: g.link.clone(),
+        sample_rate: g.info_rate,
+        block_samples: if stale { 0 } else { g.block_samples },
+        blocks_per_s: if stale { 0.0 } else { g.blocks_per_s },
+        time_div: g.params.time_div.label(),
+        time_div_id: g.params.time_div.id,
+        window_s: g.params.time_div.real_window_s(g.params.enabled.len().max(1)),
+        window_clamped: {
+            let n = g.params.enabled.len().max(1);
+            g.params.time_div.real_window_s(n) > g.params.time_div.window_s() * 1.02
+        },
+        error: g.error.clone(),
+        state: g.state.as_str().to_string(),
+        frame_id: shown.map(|s| s.id).unwrap_or(0),
+        held: g.held.is_some(),
+        rec: g.log.is_some(),
+        trigger: g.params.trigger.clone(),
+        source_span: g.source_span,
+        level_rescue: g
+            .level_rescue
+            .map(|r| LevelRescueInfo {
+                min_v: r.min_v,
+                max_v: r.max_v,
+                level_v: r.level_v,
+                age_ms: r.at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            })
+            // An old move is history, not a message: the panel must not keep
+            // explaining something that happened a minute ago.
+            .filter(|r| r.age_ms < 15_000),
+        log_path: g.log.as_ref().map(|l| l.path.display().to_string()),
+        log_bytes: g.log.as_ref().map(|l| l.bytes).unwrap_or(0),
+        log_seconds: g.log.as_ref().map(|l| l.started_at.elapsed().as_secs_f64()).unwrap_or(0.0),
+        blocks_total: g.blocks_total,
+        link_state: g.link_state.as_str(),
+        frame_age_ms: shown.map(|s| age_ms(s.created_at.elapsed())),
+        last_block_age_ms: g.last_block_at.map(|t| age_ms(t.elapsed())),
+        consecutive_errors: g.consecutive_errors,
+        reopen_attempts: g.reopen_attempts,
+        log_error: g.log_error.clone(),
     }
 }
 
@@ -1074,7 +1360,7 @@ fn ingest(
     }
 
     // Log before trimming history.
-    if let Some(log) = g.log.as_mut() {
+    if g.log.is_some() {
         let mut payload = Vec::with_capacity(64 + block.n * 16);
         payload.extend_from_slice(&block.seq.to_le_bytes());
         payload.extend_from_slice(&block.t_ns.to_le_bytes());
@@ -1094,16 +1380,38 @@ fn ingest(
             }
         }
         let len = payload.len() as u32;
-        if log.writer.write_all(&len.to_le_bytes()).is_ok()
-            && log.writer.write_all(&payload).is_ok()
-        {
-            log.bytes += 4 + len as u64;
-            log.since_fsync += 1;
-            if log.since_fsync >= 200 {
-                log.since_fsync = 0;
-                let _ = log.writer.flush();
-                let _ = log.writer.get_ref().sync_data();
+        let mut stop: Option<String> = None;
+        if let Some(log) = g.log.as_mut() {
+            if log.bytes + 4 + len as u64 > LOG_MAX_BYTES {
+                stop = Some(format!(
+                    "запись остановлена: файл достиг {} МБ",
+                    LOG_MAX_BYTES / (1024 * 1024)
+                ));
+            } else {
+                let written = log
+                    .writer
+                    .write_all(&len.to_le_bytes())
+                    .and_then(|()| log.writer.write_all(&payload));
+                match written {
+                    Ok(()) => {
+                        log.bytes += 4 + len as u64;
+                        log.since_fsync += 1;
+                        if log.since_fsync >= 200 {
+                            log.since_fsync = 0;
+                            let _ = log.writer.flush();
+                            let _ = log.writer.get_ref().sync_data();
+                        }
+                    }
+                    Err(e) => stop = Some(format!("ошибка записи журнала: {e}")),
+                }
             }
+        }
+        if let Some(reason) = stop {
+            if let Some(mut l) = g.log.take() {
+                let _ = l.writer.flush();
+            }
+            crate::diag::log(&reason);
+            g.log_error = Some(reason);
         }
     }
 
@@ -1300,6 +1608,7 @@ fn publish(
     g.publish_seq += 1;
     let snap = Snapshot {
         id: g.publish_seq,
+        created_at: Instant::now(),
         generation,
         dt_s: dt as f64,
         channels,
@@ -1390,6 +1699,11 @@ mod tests {
             level_set_at: None,
             level_rescue: None,
             source_span: None,
+            link_state: LinkState::Live,
+            last_block_at: None,
+            consecutive_errors: 0,
+            reopen_attempts: 0,
+            log_error: None,
         }
     }
 
@@ -1696,5 +2010,62 @@ mod tests {
         }
         assert_eq!(g.recent.len(), 48);
         assert_eq!(g.publish_seq, 70);
+    }
+
+    #[test]
+    fn a_stale_acquisition_reports_zero_rate_and_an_age() {
+        // The last computed rate must not survive the outage: the UI otherwise
+        // shows "16 блок/с" while nothing has arrived for minutes.
+        let mut g = inner();
+        g.info_rate = 600_000.0;
+        g.blocks_per_s = 16.0;
+        g.block_samples = 1000;
+        g.last_block_at = Some(Instant::now() - Duration::from_secs(4));
+        let st = status_from(&g, true);
+        assert_eq!(st.blocks_per_s, 0.0);
+        assert_eq!(st.block_samples, 0);
+        assert!(st.last_block_age_ms.expect("age") >= 3_900);
+    }
+
+    #[test]
+    fn a_held_frame_keeps_its_age_and_the_link_state_is_reported() {
+        // A frozen picture has two very different explanations: a held frame and
+        // a dead link. The status must carry both facts separately.
+        let mut g = inner();
+        let mut cfg = TriggerConfig::default();
+        cfg.mode = trigger::Mode::Single;
+        cfg.level_v = 0.5;
+        g.params.trigger = cfg;
+        g.armed = true;
+        g.arm_seq = 1;
+        let pinned = g.params.clone();
+        let reset = AtomicBool::new(false);
+        ingest(
+            &mut g,
+            block(&sine(4000, 125.0, 1.0, 0.0, 50_000.0), Range::V20),
+            &reset,
+            &pinned,
+            0,
+            50_000.0,
+            1,
+        );
+        g.held = g.last.clone();
+        g.link_state = LinkState::Offline;
+        let st = status_from(&g, true);
+        assert_eq!(st.link_state, "offline");
+        assert!(st.held);
+        assert_eq!(st.frame_id, 1);
+        assert!(st.frame_age_ms.is_some());
+    }
+
+    #[test]
+    fn a_missing_device_is_offline_not_a_stopped_acquisition() {
+        let mut g = inner();
+        g.link_state = LinkState::Offline;
+        g.last_block_at = None;
+        let st = status_from(&g, true);
+        assert_eq!(st.link_state, "offline");
+        assert!(st.running);
+        assert_eq!(st.blocks_per_s, 0.0);
     }
 }

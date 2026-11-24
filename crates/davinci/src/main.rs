@@ -12,6 +12,7 @@
 mod app;
 mod assets;
 mod capture;
+mod diag;
 mod driver;
 mod engine;
 mod http;
@@ -316,8 +317,8 @@ fn zero(args: &[String]) -> i32 {
                     .collect();
                 println!("{:<7} {}", range.label(), z.join(" "));
             }
-            let path = std::path::Path::new("calibration.json");
-            match calib.save(path) {
+            let path = crate::app::state_dir().join("calibration.json");
+            match calib.save(&path) {
                 Ok(()) => println!("\nсохранено в {}", path.display()),
                 Err(e) => eprintln!("\nне удалось сохранить: {e}"),
             }

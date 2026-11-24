@@ -1,0 +1,72 @@
+name: Release
+
+# Собирает установщик на Windows-раннере GitHub и прикрепляет его к релизу.
+# Ручной запуск (workflow_dispatch) только собирает артефакт; тег v* публикует
+# релиз. Тег должен совпадать с версией в Cargo.toml — это проверяется ниже.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Сверить версию тега с Cargo.toml
+        shell: pwsh
+        run: |
+          $version = ([regex]'(?m)^version\s*=\s*"([^"]+)"').Match((Get-Content Cargo.toml -Raw)).Groups[1].Value
+          Write-Host "Cargo.toml: $version"
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "тег $env:GITHUB_REF_NAME не совпадает с версией v$version"
+          }
+
+      - name: Собрать интерфейс, программу и установщик
+        shell: pwsh
+        run: ./tools/build-dist.ps1 -BuildUi
+
+      - name: Проверить артефакты
+        shell: pwsh
+        run: |
+          foreach ($file in @("dist/DaVinci.exe", "dist/DaVinci-Setup.exe", "dist/README.md")) {
+            if (-not (Test-Path $file)) { throw "нет $file" }
+          }
+          (Get-Item dist/DaVinci.exe).VersionInfo |
+            Format-List ProductVersion, FileVersion
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DaVinci-windows
+          path: |
+            dist/DaVinci.exe
+            dist/DaVinci-Setup.exe
+            dist/README.md
+
+      - name: Опубликовать релиз
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Осциллограф Хелтег да Винчи ${{ github.ref_name }}"
+          files: |
+            dist/DaVinci-Setup.exe
+            dist/DaVinci.exe
+            dist/README.md
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

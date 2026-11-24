@@ -11,6 +11,8 @@ use hantek1008::Device;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_PORT: u16 = 7411;
@@ -202,17 +204,22 @@ fn run_windowed(state: PathBuf, assets: Assets, port: u16) -> i32 {
     let proxy = event_loop.create_proxy();
     let url = format!("http://127.0.0.1:{port}/");
 
+    // The page increments this on every request. The window's watchdog reads it:
+    // a frozen renderer stops making requests, and only a reload brings it back.
+    let ui_beat = Arc::new(AtomicU64::new(0));
+    let beat_for_http = Arc::clone(&ui_beat);
+
     let worker = proxy.clone();
     std::thread::spawn(move || {
         let eng = start_engine(&state);
-        if let Err(e) = http::start(port, assets, eng) {
+        if let Err(e) = http::start(port, assets, eng, beat_for_http) {
             eprintln!("{e}");
             std::process::exit(1);
         }
         let _ = worker.send_event(crate::window::Msg::Ready);
     });
 
-    crate::window::run(event_loop, proxy, url)
+    crate::window::run(event_loop, proxy, url, ui_beat)
 }
 
 /// Hide the console window, but only if it is ours.
@@ -286,14 +293,22 @@ fn start_engine(state: &Path) -> EngineHandle {
             let engine = Engine::new(&dev);
             let handle = engine.handle();
             handle.restore(&settings);
-            std::thread::spawn(move || engine.run(dev));
+            std::thread::spawn(move || engine.run(Some(dev)));
             handle
         }
         None => {
             let link = "нет прибора".to_string();
             let reason = "Осциллограф не отвечает. Проверьте кабель и запустите «davinci doctor».".to_string();
             println!("\n{reason}\nинтерфейс всё равно откроется — в нём видно состояние связи.");
-            Engine::offline(link, reason).handle()
+            // Still spawn the loop: it keeps trying to open the instrument, so
+            // plugging the cable in later is enough. A program that has to be
+            // restarted after the device appears is the bug this fixes.
+            let engine = Engine::offline(link, reason);
+            let handle = engine.handle();
+            let settings = crate::settings::Settings::load();
+            handle.restore(&settings);
+            std::thread::spawn(move || engine.run(None));
+            handle
         }
     }
 }

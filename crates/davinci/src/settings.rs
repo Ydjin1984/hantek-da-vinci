@@ -85,8 +85,15 @@ impl Settings {
     pub fn save(&self) {
         let mut clean = self.clone();
         clean.fix();
-        if let Ok(text) = serde_json::to_string_pretty(&clean) {
-            let _ = std::fs::write(Self::path(), text);
+        let Ok(text) = serde_json::to_string_pretty(&clean) else {
+            return;
+        };
+        let path = Self::path();
+        let tmp = path.with_extension("json.tmp");
+        // Atomic replace: a power cut in the middle of a write must not leave a
+        // truncated file that `load` silently turns into defaults.
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
         }
     }
 
@@ -180,5 +187,42 @@ impl Settings {
         if let Ok(td) = TimeDiv::from_id(self.time_div_id) {
             let _ = dev.set_time_div(td);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_is_never_written_to_disk() {
+        // A program that starts in Single looks frozen after the first capture:
+        // the saved mode must always be Normal. `persist` writes through `save`,
+        // which runs `fix`, so this is the invariant that protects a restart.
+        let mut s = Settings::default();
+        s.trigger.mode = crate::trigger::Mode::Single;
+        s.fix();
+        assert_eq!(s.trigger.mode, crate::trigger::Mode::Normal);
+    }
+
+    #[test]
+    fn a_broken_file_is_repaired_instead_of_rejected() {
+        let mut s = Settings {
+            enabled: vec![],
+            ranges: vec![9, 0],
+            time_div_id: 99,
+            trigger: crate::trigger::Config {
+                mode: crate::trigger::Mode::Single,
+                source: 7,
+                ..crate::trigger::Config::default()
+            },
+            ..Settings::default()
+        };
+        s.fix();
+        assert_eq!(s.enabled, (0..CHANNELS).collect::<Vec<_>>());
+        assert!(s.ranges.iter().all(|id| (1..=3).contains(id)));
+        assert_eq!(s.time_div_id, DEFAULT_TIME_DIV_ID);
+        assert!(s.enabled.contains(&s.trigger.source));
+        assert_eq!(s.trigger.mode, crate::trigger::Mode::Normal);
     }
 }

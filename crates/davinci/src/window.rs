@@ -14,6 +14,8 @@
 //! better than a window that says "нет прибора" for a second and then changes
 //! its mind.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tao::dpi::{LogicalSize, PhysicalPosition};
@@ -47,10 +49,25 @@ pub enum Msg {
     Swap,
     /// A message from the page that only exists to wake the loop.
     Ping,
+    /// The renderer reported a failure: reload instead of leaving the last
+    /// painted frame on screen.
+    Reload,
 }
 
+/// How often the watchdog looks at the page's request counter.
+const WATCHDOG_EVERY: Duration = Duration::from_secs(5);
+/// How long the page may stop making requests before it is considered frozen.
+const WATCHDOG_SILENCE: Duration = Duration::from_secs(15);
+/// Reload attempts before giving up and leaving the window alone.
+const WATCHDOG_MAX_RELOADS: u32 = 5;
+
 /// Run the program's window. Never returns: closing it ends the process.
-pub fn run(event_loop: EventLoop<Msg>, proxy: EventLoopProxy<Msg>, url: String) -> ! {
+pub fn run(
+    event_loop: EventLoop<Msg>,
+    proxy: EventLoopProxy<Msg>,
+    url: String,
+    ui_beat: Arc<AtomicU64>,
+) -> ! {
     let icon = window_icon();
     trace("run: start");
 
@@ -86,6 +103,32 @@ pub fn run(event_loop: EventLoop<Msg>, proxy: EventLoopProxy<Msg>, url: String) 
     let (app_window, app_view) = build_app(&event_loop, &mut context, icon, &url);
     trace("run: app loaded");
 
+    // A renderer or GPU process that died takes the canvas with it; WebView2's
+    // recovery is invisible from the page, so ask the event loop to reload.
+    {
+        use wry::WebViewExtWindows;
+        let webview = app_view.webview();
+        let proxy = proxy.clone();
+        let handler = webview2_com::ProcessFailedEventHandler::create(Box::new(
+            move |_sender, args| {
+                let mut kind = Default::default();
+                let label = match args {
+                    Some(args) if unsafe { args.ProcessFailedKind(&mut kind) }.is_ok() => {
+                        format!("{kind:?}")
+                    }
+                    _ => "?".into(),
+                };
+                trace(&format!("webview: процесс упал: {label}"));
+                let _ = proxy.send_event(Msg::Reload);
+                Ok(())
+            },
+        ));
+        let mut token = 0i64;
+        unsafe {
+            let _ = webview.add_ProcessFailed(&handler, &mut token);
+        }
+    }
+
     let timer = proxy.clone();
     std::thread::spawn(move || {
         std::thread::sleep(HOLD);
@@ -98,9 +141,14 @@ pub fn run(event_loop: EventLoop<Msg>, proxy: EventLoopProxy<Msg>, url: String) 
     let mut ready = false;
     let mut fading = false;
     let mut swap = false;
+    let mut last_beat = ui_beat.load(Ordering::Relaxed);
+    let mut last_beat_at = Instant::now();
+    let mut reloads = 0u32;
 
     event_loop.run(move |event, _target, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        // A timer, not an endless wait: the watchdog below must run even when
+        // nothing else happens in the window.
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + WATCHDOG_EVERY);
 
         match event {
             // Only a close click matters; mouse, resize and focus noise does not.
@@ -117,6 +165,14 @@ pub fn run(event_loop: EventLoop<Msg>, proxy: EventLoopProxy<Msg>, url: String) 
             Event::UserEvent(Msg::Tick) => trace("msg: tick"),
             Event::UserEvent(Msg::Swap) => swap = true,
             Event::UserEvent(Msg::Ping) => {}
+            Event::UserEvent(Msg::Reload) => {
+                trace("msg: reload");
+                if let Some((_, view)) = app.as_ref() {
+                    let _ = view.reload();
+                }
+                last_beat = ui_beat.load(Ordering::Relaxed);
+                last_beat_at = Instant::now();
+            }
             _ => {}
         }
 
@@ -150,6 +206,39 @@ pub fn run(event_loop: EventLoop<Msg>, proxy: EventLoopProxy<Msg>, url: String) 
             if let Some((window, _)) = &app {
                 window.set_visible(true);
                 window.set_focus();
+            }
+            last_beat = ui_beat.load(Ordering::Relaxed);
+            last_beat_at = Instant::now();
+        }
+
+        // The page polls the local server many times a second; that counter is
+        // the only honest sign the *display* is alive. The renderer can wedge
+        // while the acquisition thread keeps running, and then the window shows
+        // the last painted frame for ever. Reload instead of asking the user to
+        // restart the program.
+        if swap {
+            if let Some((window, view)) = app.as_ref() {
+                if window.is_visible() && !window.is_minimized() {
+                    let beat = ui_beat.load(Ordering::Relaxed);
+                    if beat != last_beat {
+                        last_beat = beat;
+                        last_beat_at = Instant::now();
+                    } else if last_beat_at.elapsed() >= WATCHDOG_SILENCE {
+                        if reloads < WATCHDOG_MAX_RELOADS {
+                            trace("watchdog: страница молчит — перезагружаю");
+                            let _ = view.reload();
+                            reloads += 1;
+                        } else {
+                            trace("watchdog: страница молчит, перезагрузки исчерпаны");
+                        }
+                        last_beat_at = Instant::now();
+                    }
+                } else {
+                    // A minimised or hidden window stops timers and rAF by
+                    // design; that is not a freeze.
+                    last_beat = ui_beat.load(Ordering::Relaxed);
+                    last_beat_at = Instant::now();
+                }
             }
         }
     })

@@ -49,7 +49,18 @@ pub fn open_default() -> Result<Box<dyn Transport>> {
     Ok(Box::new(winusb::open_first()?))
 }
 
+/// Open the first instrument, waiting at most `timeout` for it to enumerate.
+#[cfg(windows)]
+pub fn open_default_within(timeout: std::time::Duration) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(winusb::open_first_within(timeout)?))
+}
+
 #[cfg(not(windows))]
 pub fn open_default() -> Result<Box<dyn Transport>> {
+    Err(crate::Error::NoDevice)
+}
+
+#[cfg(not(windows))]
+pub fn open_default_within(_timeout: std::time::Duration) -> Result<Box<dyn Transport>> {
     Err(crate::Error::NoDevice)
 }

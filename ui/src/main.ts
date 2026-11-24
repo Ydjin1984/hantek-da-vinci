@@ -47,8 +47,16 @@ interface Info {
   source_span: [number, number] | null;
   /** Set for a while after the engine moved a level no edge could reach. */
   level_rescue: { min_v: number; max_v: number; level_v: number; age_ms: number } | null;
-  log: { path: string | null; bytes: number; seconds: number };
+  log: { path: string | null; bytes: number; seconds: number; error: string | null };
   blocks_total: number;
+  /** Whether the USB link is delivering, being reopened, or absent. */
+  link_state: "live" | "reconnecting" | "offline";
+  /** Age of the frame on screen, held frame included. */
+  frame_age_ms: number | null;
+  /** Age of the newest block; grows while the instrument is silent. */
+  last_block_age_ms: number | null;
+  consecutive_errors: number;
+  reopen_attempts: number;
 }
 
 interface ChannelMeta {
@@ -198,9 +206,31 @@ function channelWord(n: number): string {
   return "каналов";
 }
 
+/** Age as a short stable string: 0,2 с / 12 с / 3 мин / 1,4 ч. */
+function ageText(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms)) return "—";
+  if (ms < 1000) return `${(ms / 1000).toFixed(1)} с`;
+  if (ms < 60_000) return `${Math.round(ms / 1000)} с`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)} мин`;
+  return `${(ms / 3_600_000).toFixed(1)} ч`;
+}
+
 function stateLabel(info: Info, cap: Capture | null): string {
-  const mode = info.trigger.mode;
+  // Link health first: a dead USB handle must never read as "waiting for a
+  // trigger", which is exactly what made a working program look hung.
+  const link = info.link_state ?? "live";
+  if (link === "offline") return "Нет прибора — ищу…";
+  if (link === "reconnecting") {
+    return info.reopen_attempts > 0
+      ? `Переподключение… (${info.reopen_attempts})`
+      : "Переподключение…";
+  }
   if (!info.running) return "Захват остановлен";
+  if (info.held) return "Экран удержан";
+  if (info.last_block_age_ms !== null && info.last_block_age_ms > 3000) {
+    return "Нет данных от прибора";
+  }
+  const mode = info.trigger.mode;
   if (mode === "single") {
     if (cap && cap.state === "captured") return "Single · захвачено";
     if (info.state === "captured") return "Single · захвачено";
@@ -259,31 +289,61 @@ const geom = { left: 88, right: 0, pw: 1, top: 14, bottom: 0 };
 
 // ---------------------------------------------------------------- API helpers
 
-async function getJSON<T>(url: string): Promise<T> {
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) {
-    let reason = `${r.status}`;
-    try {
-      const body = (await r.json()) as { error?: string };
-      if (body.error) reason = body.error;
-    } catch {
-      /* not JSON */
-    }
-    throw new Error(reason);
+/** An answer the server refused, or no answer at all (status 0). */
+class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
   }
-  return (await r.json()) as T;
+}
+
+async function getJSON<T>(url: string, timeoutMs = 4000): Promise<T> {
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+    if (!r.ok) {
+      let reason = `${r.status}`;
+      try {
+        const body = (await r.json()) as { error?: string };
+        if (body.error) reason = body.error;
+      } catch {
+        /* not JSON */
+      }
+      throw new ApiError(r.status, reason);
+    }
+    return (await r.json()) as T;
+  } catch (e) {
+    // A request that never answers must fail like an error, not stop the poll
+    // chain: the page then keeps retrying instead of freezing for ever.
+    if ((e as Error).name === "AbortError") throw new ApiError(0, "нет ответа от программы");
+    throw e;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
-  const data = (await r.json()) as T & { ok?: boolean; error?: string };
-  if (!r.ok) throw new Error(data.error ?? `${r.status}`);
-  return data;
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+    const data = (await r.json()) as T & { ok?: boolean; error?: string };
+    if (!r.ok) throw new ApiError(r.status, data.error ?? `${r.status}`);
+    return data;
+  } catch (e) {
+    if ((e as Error).name === "AbortError") throw new ApiError(0, "нет ответа от программы");
+    throw e;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 async function command(params: string): Promise<Record<string, unknown>> {
@@ -344,7 +404,9 @@ function buildShell(): void {
       <div class="plot-wrap">
         <canvas id="plot" tabindex="0" aria-label="Осциллограммы с осями напряжения и времени"></canvas>
       </div>
-      <div class="readout" id="readout"></div>
+      <div class="readout" id="readout-meas"></div>
+      <div class="readout readout-second" id="readout-frame"></div>
+      <div class="readout-alert" id="readout-alert"></div>
       <div class="foot">Тяните красный маркер T справа от дорожки источника — он задаёт уровень. Колесо мыши меняет развёртку. Курсоры A и B тянутся мышью и двигаются стрелками.</div>
     </section>
     <aside>
@@ -372,8 +434,9 @@ function buildShell(): void {
           <output id="trig-pre-out">30%</output>
         </label>
         <label class="field">Таймаут Auto, мс <input id="trig-timeout" type="number" min="0" max="10000" step="50" /></label>
-        <button id="arm" class="wide" type="button">Взвести Single</button>
-        <div class="hint" id="trig-hint"></div>
+      <button id="arm" class="wide" type="button">Взвести Single</button>
+      <button id="reconnect" class="wide" type="button">Переподключить</button>
+      <div class="hint" id="trig-hint"></div>
       </section>
       <section class="panel section">
         <h2>Курсоры</h2>
@@ -412,6 +475,7 @@ function buildShell(): void {
     void applyTimeDiv(Number(timeSelect.value));
   });
   $("run").addEventListener("click", () => void toggleRun());
+  $("reconnect").addEventListener("click", () => void reconnectLink());
   $("hold").addEventListener("click", () => void toggleHold());
   $("peaks").addEventListener("click", () => void resetPeaks());
   $("rec").addEventListener("click", () => void toggleRec());
@@ -539,10 +603,8 @@ function buildCards(): void {
     peak.textContent = "пики: —";
     const sat = document.createElement("span");
     sat.className = "sat";
-    sat.hidden = true;
     const alias = document.createElement("span");
     alias.className = "alias";
-    alias.hidden = true;
     metricsHost.append(peak, sat, alias);
     metrics["peak"] = peak;
     metrics["sat"] = sat;
@@ -610,6 +672,17 @@ async function toggleRun(): Promise<void> {
   }
 }
 
+/** Drop the USB handle and open the instrument again, without a restart. */
+async function reconnectLink(): Promise<void> {
+  try {
+    await postJSON("/api/link/reconnect", {});
+    say("переподключение связи");
+    await poll();
+  } catch (e) {
+    fail(e);
+  }
+}
+
 async function toggleHold(): Promise<void> {
   const on = !(ui.info?.held ?? false);
   try {
@@ -669,6 +742,10 @@ async function applyTrigger(patch: Partial<TriggerCfg>): Promise<void> {
 }
 
 async function applyChannels(): Promise<void> {
+  // The frame in flight still carries the old channel set; keep the user's
+  // choice until a frame with the new set arrives instead of letting the poll
+  // flip the checkboxes back for a moment.
+  pendingChannels = [...ui.enabled];
   try {
     await command(`cmd=channels&list=${ui.enabled.map((c) => c + 1).join(",")}`);
     // Disabling the trigger source must pick a replacement explicitly rather than
@@ -680,6 +757,7 @@ async function applyChannels(): Promise<void> {
     }
     await poll();
   } catch (e) {
+    pendingChannels = null;
     fail(e);
   }
 }
@@ -741,9 +819,18 @@ function paintTriggerHint(): void {
     return;
   }
 
+  if (info.held) {
+    hint.textContent = "Экран удержан кнопкой: кадр не меняется, данные продолжают идти.";
+    return;
+  }
+  if (cfg.mode === "single" && cap?.state === "captured") {
+    hint.textContent =
+      "Single держит пойманный кадр до нового взвода — нажмите «Взвести Single» или смените режим.";
+    return;
+  }
+
   const span = info.source_span;
-  if (span && cfg.mode !== "free") {
-    const [lo, hi] = span;
+  if (span && cfg.mode !== "free") {    const [lo, hi] = span;
     if (hi - lo < 0.01) {
       hint.classList.add("warn");
       hint.textContent = `Источник CH${cfg.source + 1} не меняется (${volts(lo)}) — фронта не будет.`;
@@ -779,6 +866,48 @@ function paintTriggerHint(): void {
 // ------------------------------------------------------------------ polling
 
 let polling = false;
+/** How soon to poll again; a static frame does not need eleven updates a second. */
+let pollDelay = 90;
+/** Last successful poll, for the page watchdog. */
+let lastOkAt = 0;
+/** Identity of the frame currently painted; an unchanged frame is not redrawn. */
+let lastFrameKey = "none";
+/** Channels the user just asked for; the frame may still carry the old set. */
+let pendingChannels: number[] | null = null;
+let reloading = false;
+
+function sameChannels(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/** Everything the canvas draws, so an unchanged frame is not repainted. */
+function frameKey(cap: Capture, info: Info): string {
+  const t = info.trigger;
+  return [
+    cap.frame_id,
+    cap.generation,
+    cap.width,
+    cap.channels.join(","),
+    cap.window_s,
+    cap.trigger.pct,
+    cap.trigger.free,
+    cap.trigger.clipped_pre,
+    cap.trigger.clipped_post,
+    info.held,
+    info.state,
+    info.link_state,
+    info.time_div_id,
+    t.mode,
+    t.source,
+    t.edge,
+    t.level_v,
+    t.pretrigger_pct,
+    cap.channel_meta
+      .map((m) => `${m.full_scale_v}/${m.center_v}/${m.autoscale}/${m.peak_min}/${m.peak_max}/${m.saturated}`)
+      .join(","),
+    cap.stats.map((s) => `${s.vmin}/${s.vmax}/${s.freq}/${s.aliased}`).join(","),
+  ].join("|");
+}
 
 async function poll(): Promise<void> {
   if (polling) return;
@@ -791,23 +920,61 @@ async function poll(): Promise<void> {
 
     const width = Math.min(2400, Math.max(200, Math.round(canvas.clientWidth || 1200)));
     if (width !== ui.width) ui.width = width;
-    // One answer carries the frame and its metadata together, so whatever was
-    // measured belongs to whatever is drawn.
-    const cap = await getJSON<Capture>(`/api/capture/v2?width=${width}`);
-    ui.cap = cap;
-    ui.columns = decodeColumns(cap);
-    if (cap.channels.length && !cap.channels.includes(ui.activeCh)) {
-      ui.activeCh = cap.channels[0];
+
+    let cap: Capture | null = null;
+    try {
+      // One answer carries the frame and its metadata together, so whatever was
+      // measured belongs to whatever is drawn.
+      cap = await getJSON<Capture>(`/api/capture/v2?width=${width}`);
+    } catch (e) {
+      // 404 "кадров пока нет" is the normal state before the first capture, not
+      // a broken program. Painting it as an error kept the status red all night.
+      if (!(e instanceof ApiError && e.status === 404)) throw e;
     }
-    ui.enabled = [...cap.channels];
+
+    if (cap) {
+      ui.cap = cap;
+      ui.columns = decodeColumns(cap);
+      if (cap.channels.length && !cap.channels.includes(ui.activeCh)) {
+        ui.activeCh = cap.channels[0];
+      }
+      if (pendingChannels && sameChannels(cap.channels, pendingChannels)) {
+        pendingChannels = null;
+      }
+      if (!pendingChannels) ui.enabled = [...cap.channels];
+    }
+
+    // A successful answer clears any earlier error; otherwise one transient
+    // failure marked the program broken until it was restarted.
+    ui.error = "";
     syncControls(info, cap);
-    paintCards(cap);
-    draw();
+
+    if (cap) {
+      const key = frameKey(cap, info);
+      if (key !== lastFrameKey) {
+        lastFrameKey = key;
+        paintCards(cap);
+        draw();
+        pollDelay = 90;
+      } else {
+        // A held or Single frame is deliberately static; polling it eleven
+        // times a second only burns CPU on the status line. Keep the link and
+        // the age visible, but at a calmer rate.
+        pollDelay = 350;
+      }
+    } else if (lastFrameKey !== "none") {
+      lastFrameKey = "none";
+      draw();
+      pollDelay = 500;
+    } else {
+      pollDelay = 500;
+    }
+    lastOkAt = performance.now();
   } catch (e) {
     // The last frame stays on screen and the status says why: losing the link
     // must not erase the measurement the user was reading.
     fail(e);
-    draw();
+    paintStatus(ui.info, ui.cap);
   } finally {
     polling = false;
   }
@@ -827,7 +994,63 @@ function decodeColumns(cap: Capture): Int16Array | null {
   return out;
 }
 
-function syncControls(info: Info, cap: Capture): void {
+/**
+ * The one-line status. Every slot has a fixed width in CSS, so a frame number
+ * growing from 999 to 10 000, or the age changing from «2,1 с» to «12 мин»,
+ * cannot shuffle the rest of the toolbar.
+ */
+function paintStatus(info: Info | null, cap: Capture | null): void {
+  const host = $("status");
+  host.textContent = "";
+  host.title = "";
+  const add = (cls: string, text: string) => {
+    const span = document.createElement("span");
+    span.className = cls;
+    span.textContent = text;
+    host.append(span);
+  };
+
+  if (ui.error) {
+    host.className = "status error";
+    add("slot s-note", `ошибка: ${ui.error}`);
+    host.title = ui.error;
+    return;
+  }
+  host.className = "status";
+  if (!info) {
+    add("slot s-state", "нет связи с программой");
+    return;
+  }
+
+  add("slot s-state", stateLabel(info, cap));
+  add("sep", "·");
+  add(
+    "slot s-frame",
+    cap ? `кадр ${cap.frame_id} · ${ageText(info.frame_age_ms)} назад` : "кадр —",
+  );
+  add("sep", "·");
+
+  const staleAge = info.last_block_age_ms ?? null;
+  const stale = staleAge !== null && staleAge > 3000;
+  const data = staleAge === null
+    ? "данных ещё нет"
+    : stale
+      ? `нет данных ${ageText(staleAge)}`
+      : `данные · ${fmt(info.blocks_per_s, 1)} блок/с`;
+  add(`slot s-data${stale ? " warn" : ""}`, data);
+
+  const note =
+    ui.message ||
+    info.log?.error ||
+    ((info.link_state ?? "live") !== "live" ? info.error ?? "" : "");
+  if (note) {
+    add("sep", "·");
+    add("slot s-note", note);
+  }
+  if (info.error) host.title = info.error;
+}
+
+function syncControls(info: Info, cap: Capture | null): void {
   const run = $("run");
   run.textContent = info.running ? "Стоп" : "Пуск";
   run.classList.toggle("live", info.running);
@@ -840,58 +1063,74 @@ function syncControls(info: Info, cap: Capture): void {
   rec.setAttribute("aria-pressed", String(info.rec));
   rec.textContent = info.rec ? "Остановить запись" : "Запись";
 
-  $("pill-rec").textContent = info.rec ? "REC идёт" : "REC выкл";
-  $("pill-rec").className = `pill${info.rec ? " rec" : ""}`;
+  const recErr = info.log?.error ?? null;
+  $("pill-rec").textContent = recErr ? "REC ошибка" : info.rec ? "REC идёт" : "REC выкл";
+  $("pill-rec").className = `pill${recErr ? " bad" : info.rec ? " rec" : ""}`;
+  $("pill-rec").title = recErr ?? "";
 
   const link = $("pill-link");
+  const linkState = info.link_state ?? "live";
   if (info.error) {
-    link.textContent = "нет связи";
+    link.textContent = linkState === "offline" ? "нет прибора" : "нет связи";
     link.className = "pill bad";
     link.title = info.error;
+  } else if (linkState === "offline") {
+    link.textContent = "нет прибора";
+    link.className = "pill bad";
+    link.title = info.link;
+  } else if (linkState === "reconnecting") {
+    link.textContent = "переподключение";
+    link.className = "pill warn";
+    link.title = info.error ?? info.link;
   } else {
     link.textContent = info.running ? "прибор" : "прибор · стоп";
     link.className = `pill${info.running ? " ok" : ""}`;
     link.title = info.link;
   }
 
-  $("pill-rate").textContent = `${fmt(cap.sample_rate / 1000, 1)} квыб/с · ${fmt(info.blocks_per_s, 1)} блок/с`;
-  $("subtitle").textContent = `${cap.channels.length} ${channelWord(cap.channels.length)} · 12 бит · ${info.time_div}`;
+  // Padded to a fixed width: 9,9 turning into 10,0 must not resize the pill and
+  // push the buttons beside it.
+  const rate = cap?.sample_rate ?? info.sample_rate;
+  $("pill-rate").textContent =
+    `${fmt(rate / 1000, 1).padStart(5, " ")} квыб/с · ` +
+    `${fmt(info.blocks_per_s, 1).padStart(5, " ")} блок/с`;
+
+  const nCh = cap?.channels.length ?? ui.enabled.length;
+  $("subtitle").textContent = `${nCh} ${channelWord(nCh)} · 12 бит · ${info.time_div}`;
 
   const timeSelect = $<HTMLSelectElement>("time-div");
   if (document.activeElement !== timeSelect) timeSelect.value = String(info.time_div_id);
 
+  // Three fixed slots, not one sentence: the label «окно» must not slide left
+  // when the value changes from «972,2 мкс» to «1,598 мс».
   const windowInfo = $("window-info");
-  const actual = cap.window_s;
+  windowInfo.textContent = "";
+  const actual = cap?.window_s ?? info.window_s;
   const requested = nsPerDiv(info.time_div_id) * 10 * 1e-9;
-  windowInfo.textContent =
-    info.window_clamped || actual + 1e-12 < requested
-      ? `окно ${seconds(actual)} (запрошено ${seconds(requested)})`
-      : `окно ${seconds(actual)} · ${timeDivLabel(info.time_div_id)}`;
+  const clamped = info.window_clamped || actual + 1e-12 < requested;
+  const wiLabel = document.createElement("span");
+  wiLabel.className = "wi-label";
+  wiLabel.textContent = "окно";
+  const wiValue = document.createElement("span");
+  wiValue.className = "wi-val";
+  wiValue.textContent = seconds(actual);
+  const wiSuffix = document.createElement("span");
+  wiSuffix.className = "wi-suffix";
+  wiSuffix.textContent = clamped
+    ? `(запрошено ${seconds(requested)})`
+    : `· ${timeDivLabel(info.time_div_id)}`;
+  windowInfo.append(wiLabel, wiValue, wiSuffix);
 
   $("trigger-state").innerHTML = `<b>${stateLabel(info, cap)}</b>`;
   syncTriggerFields();
-
-  const status = $("status");
-  if (ui.error) {
-    status.textContent = `ошибка: ${ui.error}`;
-    status.className = "status error";
-  } else {
-    const bits = [
-      stateLabel(info, cap),
-      `кадр ${cap.frame_id}`,
-      info.held ? "экран удержан" : "",
-      ui.message,
-    ].filter(Boolean);
-    status.textContent = bits.join(" · ");
-    status.className = "status";
-  }
+  paintStatus(info, cap);
 }
 
 // --------------------------------------------------------------------- cards
 
 function paintCards(cap: Capture): void {
   cards.forEach((card, ch) => {
-    const on = cap.channels.includes(ch);
+    const on = (pendingChannels ?? cap.channels).includes(ch);
     card.root.classList.toggle("off", !on);
     if (card.on.checked !== on && document.activeElement !== card.on) card.on.checked = on;
 
@@ -929,10 +1168,8 @@ function paintCards(cap: Capture): void {
       const peakHigh = meta?.peak_max ?? null;
       set("peak", `пики за сеанс: ${volts(peakLow)} … ${volts(peakHigh)}`);
       const sat = card.metrics["sat"];
-      sat.hidden = !(meta?.saturated ?? false);
       sat.textContent = meta?.saturated ? "АЦП на пределе" : "";
       const alias = card.metrics["alias"];
-      alias.hidden = !stat.aliased;
       alias.textContent = !stat.aliased
         ? ""
         : stat.alias_reason === "jumps"
@@ -943,8 +1180,8 @@ function paintCards(cap: Capture): void {
         set(key, "—");
       }
       set("peak", "пики: —");
-      card.metrics["sat"].hidden = true;
-      card.metrics["alias"].hidden = true;
+      card.metrics["sat"].textContent = "";
+      card.metrics["alias"].textContent = "";
     }
   });
 }
@@ -1198,7 +1435,11 @@ function draw(): void {
     ctx.fillStyle = "#7f8899";
     ctx.fillText(unit.suffix, left - 4, bottom + 32);
     ctx.textAlign = "right";
-    ctx.fillText(`окно ${seconds(cap.window_s)} · ${timeDivLabel(ui.timeDivId)}`, right, bottom + 32);
+    // Padded to fixed widths: the right edge is pinned, so the left edge of the
+    // caption must not move when «мкс» becomes «мс».
+    const winText = seconds(cap.window_s).padStart(9, " ");
+    const divText = timeDivLabel(ui.timeDivId).padStart(11, " ");
+    ctx.fillText(`окно ${winText} · ${divText}`, right, bottom + 32);
   }
 
   // Cursors.
@@ -1246,46 +1487,75 @@ function draw(): void {
 }
 
 function paintReadout(cap: Capture | null): void {
-  const host = $("readout");
-  const bits: string[] = [];
+  const meas = $("readout-meas");
+  const frame = $("readout-frame");
+  const alertHost = $("readout-alert");
+  meas.textContent = "";
+  frame.textContent = "";
+  alertHost.textContent = "";
   if (!cap) {
-    host.textContent = "нет кадра";
+    meas.textContent = "нет кадра";
     return;
   }
+
+  // Two fixed rows instead of one long line: the scope panel is narrower than
+  // the window, and eleven slots in a row were clipped. Every value still sits
+  // in its own fixed-width slot, so «999» → «10 000» moves nothing.
+  const add = (host: HTMLElement, label: string, value: string) => {
+    const span = document.createElement("span");
+    span.className = "ro";
+    const b = document.createElement("b");
+    b.textContent = label;
+    const v = document.createElement("i");
+    v.textContent = value;
+    span.append(b, " ", v);
+    host.append(span);
+  };
+
   const mode = ui.cursors.mode;
   if (mode === "time") {
     const dt = (ui.cursors.b - ui.cursors.a) * cap.window_s;
-    bits.push(`<span><b>Δt</b> ${seconds(dt)}</span>`);
-    bits.push(`<span><b>1/|Δt|</b> ${dt !== 0 ? hz(1 / Math.abs(dt)) : "—"}</span>`);
-  } else if (mode === "voltage") {
-    const lane = layout.find((l) => l.ch === ui.activeCh) ?? layout[0];
-    if (lane) {
-      const va = lane.vY(lane.y + 2 + ui.cursors.a * (lane.lane - 4));
-      const vb = lane.vY(lane.y + 2 + ui.cursors.b * (lane.lane - 4));
-      bits.push(`<span><b>A</b> ${volts(va)}</span>`);
-      bits.push(`<span><b>B</b> ${volts(vb)}</span>`);
-      bits.push(`<span><b>ΔV</b> ${volts(va - vb)}</span>`);
-      bits.push(`<span><b>CH${lane.ch + 1}</b></span>`);
-    }
+    add(meas, "Δt", seconds(dt));
+    add(meas, "1/|Δt|", dt !== 0 ? hz(1 / Math.abs(dt)) : "—");
+  } else {
+    add(meas, "Δt", "—");
+    add(meas, "1/|Δt|", "—");
   }
-  bits.push(`<span><b>кадр</b> ${cap.frame_id}</span>`);
-  bits.push(`<span><b>выборка</b> ${hz(cap.sample_rate)}</span>`);
-  bits.push(`<span><b>отсчётов</b> ${fmt(cap.window_samples, 0)}</span>`);
-  bits.push(`<span><b>окно</b> ${seconds(cap.window_s)}</span>`);
+
+  const lane = layout.find((l) => l.ch === ui.activeCh) ?? layout[0];
+  if (mode === "voltage" && lane) {
+    const va = lane.vY(lane.y + 2 + ui.cursors.a * (lane.lane - 4));
+    const vb = lane.vY(lane.y + 2 + ui.cursors.b * (lane.lane - 4));
+    add(meas, "A", volts(va));
+    add(meas, "B", volts(vb));
+    add(meas, "ΔV", volts(va - vb));
+  } else {
+    add(meas, "A", "—");
+    add(meas, "B", "—");
+    add(meas, "ΔV", "—");
+  }
+  add(meas, "CH", lane ? `CH${lane.ch + 1}` : "—");
+
+  add(frame, "кадр", String(cap.frame_id));
+  add(frame, "выборка", hz(cap.sample_rate));
+  add(frame, "отсчётов", fmt(cap.window_samples, 0));
+  add(frame, "окно", seconds(cap.window_s));
+  add(frame, "T₀", cap.trigger.free ? "—" : `${fmt(cap.trigger.pct, 1)}%`);
+
+  // Warnings live on their own line with a reserved height, so an appearing or
+  // disappearing warning never shifts the readout above it.
   const dropouts = cap.channel_meta.reduce((sum, m) => sum + (m.dropouts ?? 0), 0);
-  if (dropouts > 0) bits.push(`<span><b>сбоев АЦП</b> ${dropouts}</span>`);
   const aliased = cap.stats.filter((s) => s.aliased);
+  const alerts: string[] = [];
+  if (dropouts > 0) alerts.push(`сбоев АЦП: ${dropouts}`);
   if (aliased.length > 0) {
-    bits.push(
-      `<span class="warn"><b>мало точек</b> ${aliased.map((s) => `CH${s.ch + 1}`).join(", ")}</span>`,
-    );
+    alerts.push(`мало точек: ${aliased.map((s) => `CH${s.ch + 1}`).join(", ")}`);
   }
   if (cap.trigger.clipped_pre || cap.trigger.clipped_post) {
-    bits.push(`<span><b>T₀</b> ${fmt(cap.trigger.pct, 1)}% (обрезано)</span>`);
-  } else if (!cap.trigger.free) {
-    bits.push(`<span><b>T₀</b> ${fmt(cap.trigger.pct, 1)}%</span>`);
+    const side = cap.trigger.clipped_pre ? "до фронта" : "после фронта";
+    alerts.push(`кадр обрезан ${side}`);
   }
-  host.innerHTML = bits.join("");
+  alertHost.textContent = alerts.join(" · ");
 }
 
 // --------------------------------------------------------------- interaction
@@ -1500,13 +1770,39 @@ async function boot(): Promise<void> {
     fail(e);
   }
   await poll();
+  lastOkAt = performance.now();
 
   // One request in flight at a time; a slow USB block must not queue up polls.
   const tick = async (): Promise<void> => {
     if (!document.hidden) await poll();
-    setTimeout(() => void tick(), 90);
+    setTimeout(() => void tick(), pollDelay);
   };
   void tick();
+
+  // Page-side watchdog: a fetch that never answers must not leave the tick
+  // chain dead for the rest of the session. The native window runs a second
+  // watchdog on the HTTP request counter, for a renderer that stops executing
+  // this script altogether.
+  window.setInterval(() => {
+    if (document.hidden) {
+      lastOkAt = performance.now();
+      return;
+    }
+    if (!reloading && performance.now() - lastOkAt > 15_000) {
+      reloading = true;
+      location.reload();
+    }
+  }, 5_000);
+
+  document.addEventListener("visibilitychange", () => {
+    lastOkAt = performance.now();
+    // Coming back from a hidden window may mean the compositor lost the canvas;
+    // force one repaint even if the frame has not changed.
+    if (!document.hidden) {
+      void poll();
+      draw();
+    }
+  });
 }
 
 void boot();

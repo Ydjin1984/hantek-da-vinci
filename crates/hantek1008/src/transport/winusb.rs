@@ -249,7 +249,16 @@ pub fn device_paths() -> Vec<String> {
 /// re-appears; a caller that arrives during that window would otherwise see
 /// "not found" for a device that is physically plugged in.
 pub fn open_first() -> Result<WinUsbTransport> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    open_first_within(std::time::Duration::from_secs(6))
+}
+
+/// Same, with an explicit enumeration window.
+///
+/// The acquisition supervisor uses a short window for a reopen so the window can
+/// report "переподключение" instead of blocking for six seconds; the caller
+/// retries with a growing pause anyway.
+pub fn open_first_within(timeout: std::time::Duration) -> Result<WinUsbTransport> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut last: Option<Error> = None;
     loop {
         let paths = device_paths();
@@ -284,19 +293,14 @@ unsafe impl Send for WinUsbTransport {}
 
 impl WinUsbTransport {
     pub fn open(path: &str) -> Result<WinUsbTransport> {
-        // Some WinUSB builds only hand out an interface handle when the file
-        // handle was opened for overlapped I/O; others are happy with a plain
-        // synchronous handle. Try the simple one first, then the other, and
-        // report both failures if neither works.
-        match Self::open_with(path, 0) {
-            Ok(t) => Ok(t),
-            Err(first) => match Self::open_with(path, FILE_FLAG_OVERLAPPED) {
-                Ok(t) => Ok(t),
-                Err(second) => Err(Error::Protocol(format!(
-                    "WinUSB не принял устройство: {first} / {second}"
-                ))),
-            },
-        }
+        // Always overlapped. The protocol needs `drain` to return after a short
+        // wait, and a synchronous handle cannot do that: on machines where the
+        // old "try simple first" succeeded, every command response stayed in the
+        // pipe and the command stream desynchronised. A synchronous reopen is
+        // not worth that risk.
+        Self::open_with(path, FILE_FLAG_OVERLAPPED).map_err(|e| {
+            Error::Protocol(format!("WinUSB не принял устройство: {e}"))
+        })
     }
 
     fn open_with(path: &str, flags: u32) -> Result<WinUsbTransport> {

@@ -58,7 +58,18 @@ impl Device {
     /// Open the first instrument found over WinUSB.
     #[cfg(windows)]
     pub fn open() -> Result<Device> {
-        let io = crate::transport::open_default()?;
+        Device::open_within(Duration::from_secs(6))
+    }
+
+    /// Open the first instrument found, waiting at most `timeout` for it to
+    /// enumerate.
+    ///
+    /// The supervisor uses a short timeout for a reopen: a device that is still
+    /// re-enumerating is better retried after a pause than blocked on for six
+    /// seconds while the window says "переподключение".
+    #[cfg(windows)]
+    pub fn open_within(timeout: Duration) -> Result<Device> {
+        let io = crate::transport::open_default_within(timeout)?;
         let link = io.describe();
         let mut dev = Device {
             io,
@@ -78,6 +89,12 @@ impl Device {
     /// No native transport on this platform yet; use [`Device::with_transport`].
     #[cfg(not(windows))]
     pub fn open() -> Result<Device> {
+        Err(Error::NoDevice)
+    }
+
+    /// No native transport on this platform yet.
+    #[cfg(not(windows))]
+    pub fn open_within(_timeout: Duration) -> Result<Device> {
         Err(Error::NoDevice)
     }
 
