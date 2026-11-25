@@ -1,11 +1,17 @@
 //! The window the program actually is.
 //!
-//! Two windows, one process. A frameless dark plate carries the mark while the
-//! instrument is opened and the sample rate measured; behind it the real window
-//! is already loading, so when the plate has burned for its two seconds and
-//! dissolved, the program is simply there. The interface itself is unchanged —
-//! still a page talking to `127.0.0.1` — but the frame belongs to this process,
-//! so the program is a window and not a browser tab.
+//! Up to three windows, one process. A frameless dark plate carries the mark
+//! while the instrument is opened and the sample rate measured; behind it the
+//! real window is already loading, so when the plate has burned for its two
+//! seconds and dissolved, the program is simply there. The interface itself is
+//! unchanged — still a page talking to `127.0.0.1` — but the frame belongs to
+//! this process, so the program is a window and not a browser tab.
+//!
+//! The third window is mini mode: a decorated, always-on-top window with the
+//! first three channels. It is built on demand, minimises the main window and
+//! disappears again when its button, its close box or a taskbar restore of the
+//! main window asks for it. It shares the same HTTP server and capture engine,
+//! so switching windows never touches the instrument.
 //!
 //! Why an event loop on the main thread: `tao` insists on it. Everything slow
 //! (opening the instrument, measuring the rate, binding the socket) is moved to
@@ -28,6 +34,20 @@ include!(concat!(env!("OUT_DIR"), "/window_icon.rs"));
 
 /// Also used to find the running copy when a second one is started.
 pub const TITLE: &str = "Осциллограф Хелтег да Винчи";
+
+/// Заголовок отдельного окна мини-режима.
+const MINI_TITLE: &str = "DaVinci Scope — мини-режим";
+/// Стартовый размер при 100 % масштабе Windows. Это внутренний размер: рамку
+/// заголовка, как и любому обычному окну, добавляет система.
+const MINI_W: f64 = 360.0;
+const MINI_H: f64 = 280.0;
+/// Ниже этого три графика перестают помещаться.
+const MINI_MIN_W: f64 = 320.0;
+const MINI_MIN_H: f64 = 230.0;
+/// Отступ от края рабочей области, когда позиция ещё не запомнена.
+const MINI_MARGIN: i32 = 24;
+/// Как часто разрешено писать позицию мини-окна на диск во время перетаскивания.
+const MINI_SAVE_EVERY: Duration = Duration::from_millis(400);
 
 /// How long the mark burns before it starts to dissolve.
 const HOLD: Duration = Duration::from_millis(2000);
@@ -52,6 +72,12 @@ pub enum Msg {
     /// The renderer reported a failure: reload instead of leaving the last
     /// painted frame on screen.
     Reload,
+    /// The main page asked for the mini window: minimise the main window and
+    /// put the small always-on-top window on screen.
+    MiniOpen,
+    /// The mini page asked to go back (its button; the native close box arrives
+    /// as `CloseRequested`).
+    MiniClose,
 }
 
 /// How often the watchdog looks at the page's request counter.
@@ -100,7 +126,8 @@ pub fn run(
     trace("run: plate up");
 
     // Loads underneath the plate, so its own start-up is not on the clock.
-    let (app_window, app_view) = build_app(&event_loop, &mut context, icon, &url);
+    let (app_window, app_view) =
+        build_app(&event_loop, &mut context, icon.clone(), &url, proxy.clone());
     trace("run: app loaded");
 
     // A renderer or GPU process that died takes the canvas with it; WebView2's
@@ -138,6 +165,12 @@ pub fn run(
     let mut splash = Some((splash_window, splash_view));
     let app_id = app_window.id();
     let app = Some((app_window, app_view));
+    let mini_url = format!("{url}mini.html");
+    // At most one mini window, ever: every "open" either focuses this one or
+    // builds it, and every "close" takes it out of the same slot.
+    let mut mini: Option<(Window, WebView)> = None;
+    let mut mini_opened_at = Instant::now();
+    let mut mini_saved_at = Instant::now();
     let mut ready = false;
     let mut fading = false;
     let mut swap = false;
@@ -145,7 +178,7 @@ pub fn run(
     let mut last_beat_at = Instant::now();
     let mut reloads = 0u32;
 
-    event_loop.run(move |event, _target, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         // A timer, not an endless wait: the watchdog below must run even when
         // nothing else happens in the window.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + WATCHDOG_EVERY);
@@ -154,9 +187,43 @@ pub fn run(
             // Only a close click matters; mouse, resize and focus noise does not.
             Event::WindowEvent { event: WindowEvent::CloseRequested, window_id, .. } => {
                 if app_id == window_id || splash.is_some() {
+                    if let Some((window, _)) = &mini {
+                        if let Ok(pos) = window.outer_position() {
+                            save_mini_position(pos);
+                        }
+                    }
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
+                // The mini window's own close box means "back to the program",
+                // not "leave the program".
+                if mini.as_ref().is_some_and(|(window, _)| window.id() == window_id) {
+                    close_mini(&mut mini, &app);
+                    return;
+                }
+            }
+            Event::WindowEvent { event: WindowEvent::Moved(position), window_id, .. } => {
+                // Dragging produces a flood of positions; writing every one of
+                // them would make the disk the busiest part of the program. The
+                // last position is saved on close and on exit as well.
+                if mini.as_ref().is_some_and(|(window, _)| window.id() == window_id)
+                    && mini_saved_at.elapsed() >= MINI_SAVE_EVERY
+                {
+                    save_mini_position(position);
+                    mini_saved_at = Instant::now();
+                }
+            }
+            // The taskbar icon restores the main window; that is the user
+            // leaving mini mode, so the small window goes away with it. The
+            // short delay ignores a focus event left over from the click that
+            // opened the small window; the fallback below covers a real restore
+            // inside that window too.
+            Event::WindowEvent { event: WindowEvent::Focused(true), window_id, .. }
+                if window_id == app_id
+                    && mini.is_some()
+                    && mini_opened_at.elapsed() >= Duration::from_millis(600) =>
+            {
+                close_mini(&mut mini, &app);
             }
             Event::UserEvent(Msg::Ready) => {
                 ready = true;
@@ -173,6 +240,34 @@ pub fn run(
                 last_beat = ui_beat.load(Ordering::Relaxed);
                 last_beat_at = Instant::now();
             }
+            Event::UserEvent(Msg::MiniOpen) => {
+                if let Some((window, _)) = &mini {
+                    window.set_minimized(false);
+                    window.set_visible(true);
+                    window.set_focus();
+                } else {
+                    trace("mini: open");
+                    if let Some((window, view)) = build_mini(
+                        target,
+                        &mut context,
+                        icon.clone(),
+                        &mini_url,
+                        proxy.clone(),
+                    ) {
+                        // Minimise only after the small window exists: a
+                        // failure to build it must never leave the program
+                        // with no visible window at all.
+                        if let Some((main, _)) = &app {
+                            main.set_minimized(true);
+                        }
+                        window.set_focus();
+                        mini_opened_at = Instant::now();
+                        mini_saved_at = Instant::now();
+                        mini = Some((window, view));
+                    }
+                }
+            }
+            Event::UserEvent(Msg::MiniClose) => close_mini(&mut mini, &app),
             _ => {}
         }
 
@@ -241,6 +336,17 @@ pub fn run(
                 }
             }
         }
+
+        // A restore from the taskbar is also visible as "the main window is no
+        // longer minimised". Focus is the usual signal, but the invariant is
+        // kept even if that event is missed; the short delay lets the minimise
+        // requested on open settle first.
+        if mini.is_some()
+            && mini_opened_at.elapsed() >= Duration::from_millis(600)
+            && app.as_ref().is_some_and(|(window, _)| !window.is_minimized())
+        {
+            close_mini(&mut mini, &app);
+        }
     })
 }
 
@@ -274,6 +380,7 @@ fn build_app<T>(
     context: &mut WebContext,
     icon: Option<Icon>,
     url: &str,
+    events: EventLoopProxy<Msg>,
 ) -> (Window, WebView) {
     let window = WindowBuilder::new()
         .with_title(TITLE)
@@ -289,6 +396,13 @@ fn build_app<T>(
     let view = WebViewBuilder::new_with_web_context(context)
         .with_url(url)
         .with_background_color(BG)
+        // The page cannot create a native topmost window, so it asks this side
+        // through the tiny wry IPC bridge. Nothing else is accepted here.
+        .with_ipc_handler(move |request| {
+            if request.body().trim() == "mini-open" {
+                let _ = events.send_event(Msg::MiniOpen);
+            }
+        })
         // A hard cut between a dissolved mark and a full window looks like a
         // flicker, so the content itself arrives with a short fade.
         .with_initialization_script(
@@ -302,6 +416,103 @@ fn build_app<T>(
         .build(&window)
         .expect("интерфейс");
     (window, view)
+}
+
+/// The mini window: a real decorated window, so it is dragged by its title and
+/// can sit on any monitor, and topmost, so a borderless full-screen program does
+/// not bury the traces. It is not modal: the user works in another application
+/// while it stays on top.
+fn build_mini<T>(
+    target: &EventLoopWindowTarget<T>,
+    context: &mut WebContext,
+    icon: Option<Icon>,
+    url: &str,
+    events: EventLoopProxy<Msg>,
+) -> Option<(Window, WebView)> {
+    let window = WindowBuilder::new()
+        .with_title(MINI_TITLE)
+        .with_inner_size(LogicalSize::new(MINI_W, MINI_H))
+        .with_min_inner_size(LogicalSize::new(MINI_MIN_W, MINI_MIN_H))
+        .with_theme(Some(Theme::Dark))
+        .with_always_on_top(true)
+        .with_visible(false)
+        .with_window_icon(icon)
+        .build(target)
+        .expect("мини-окно");
+    #[cfg(windows)]
+    {
+        use tao::platform::windows::WindowExtWindows;
+        native::dark_brush(window.hwnd());
+        native::dark_title(window.hwnd());
+    }
+    place_mini(&window);
+
+    let view = match WebViewBuilder::new_with_web_context(context)
+        .with_url(url)
+        .with_background_color(BG)
+        .with_ipc_handler(move |request| {
+            if request.body().trim() == "mini-close" {
+                let _ = events.send_event(Msg::MiniClose);
+            }
+        })
+        .build(&window)
+    {
+        Ok(view) => view,
+        Err(e) => {
+            // The small window is a convenience; failing to build it must leave
+            // the main window exactly where it was, not abort the program.
+            trace(&format!("mini: не создан: {e}"));
+            drop(window);
+            return None;
+        }
+    };
+    window.set_visible(true);
+    window.set_focus();
+    Some((window, view))
+}
+
+/// Put the mini window where it was last time, clamped to a work area that
+/// actually exists. A monitor unplugged since the previous run must not leave
+/// the window at coordinates nobody can see.
+fn place_mini(window: &Window) {
+    let size = window.outer_size();
+    let (x, y) = match load_mini_position() {
+        Some(pos) => native::clamp_to_work_area(pos.x, pos.y, size.width as i32, size.height as i32),
+        None => native::default_mini_position(size.width as i32, size.height as i32),
+    };
+    window.set_outer_position(PhysicalPosition::new(x, y));
+}
+
+fn mini_position_file() -> std::path::PathBuf {
+    crate::app::state_dir().join("mini-window.txt")
+}
+
+fn load_mini_position() -> Option<PhysicalPosition<i32>> {
+    let text = std::fs::read_to_string(mini_position_file()).ok()?;
+    let (x, y) = text.trim().split_once(',')?;
+    Some(PhysicalPosition::new(x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+fn save_mini_position(pos: PhysicalPosition<i32>) {
+    let _ = std::fs::write(mini_position_file(), format!("{},{}", pos.x, pos.y));
+}
+
+/// Drop the mini window and bring the main one back. Used by the back button,
+/// the native close box and a restore from the taskbar.
+fn close_mini(mini: &mut Option<(Window, WebView)>, app: &Option<(Window, WebView)>) {
+    let Some((window, view)) = mini.take() else { return };
+    if let Ok(pos) = window.outer_position() {
+        save_mini_position(pos);
+    }
+    // The webview first: it borrows the window's handle.
+    drop(view);
+    drop(window);
+    if let Some((window, _)) = app {
+        window.set_minimized(false);
+        window.set_visible(true);
+        window.set_focus();
+    }
+    trace("mini: closed, main restored");
 }
 
 /// `1440x900`, unless the screen is smaller than that plus a margin.
@@ -391,7 +602,8 @@ pub fn raise_existing() -> bool {
     }
 }
 
-/// The two Windows calls that make the plate look intentional.#[cfg(windows)]
+/// The Windows calls that make the windows look intentional.
+#[cfg(windows)]
 mod native {
     use std::ffi::c_void;
 
@@ -406,6 +618,114 @@ mod native {
     #[link(name = "dwmapi")]
     extern "system" {
         fn DwmSetWindowAttribute(window: *mut c_void, attribute: u32, value: *const c_void, size: u32) -> i32;
+    }
+
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        flags: u32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MonitorFromPoint(point: Point, flags: u32) -> *mut c_void;
+        fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+        fn GetCursorPos(point: *mut Point) -> i32;
+    }
+
+    const MONITOR_DEFAULTTONULL: u32 = 0;
+    const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
+
+    /// The part of a monitor not covered by the taskbar, for the monitor that
+    /// owns a point. `None` when the point is on no monitor at all — which is
+    /// exactly what a disconnected second screen leaves behind.
+    fn work_area_at(point: Point) -> Option<Rect> {
+        unsafe {
+            let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
+            if monitor.is_null() {
+                return None;
+            }
+            let mut info = MonitorInfo {
+                cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                rc_monitor: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+                rc_work: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+                flags: 0,
+            };
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            Some(info.rc_work)
+        }
+    }
+
+    fn cursor_work_area() -> Option<Rect> {
+        let mut point = Point { x: 0, y: 0 };
+        let ok = unsafe { GetCursorPos(&mut point) };
+        let area = if ok != 0 { work_area_at(point) } else { None };
+        area.or_else(|| {
+            // No cursor (a service, a locked session): the primary monitor is
+            // still the safe answer.
+            unsafe {
+                let monitor = MonitorFromPoint(Point { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+                if monitor.is_null() {
+                    return None;
+                }
+                let mut info = MonitorInfo {
+                    cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                    rc_monitor: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+                    rc_work: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+                    flags: 0,
+                };
+                (GetMonitorInfoW(monitor, &mut info) != 0).then_some(info.rc_work)
+            }
+        })
+    }
+
+    /// `(x, y)` for a saved mini-window position, kept fully inside a working
+    /// area. A position from a monitor that is no longer connected is clamped
+    /// into the work area of the monitor under the cursor instead.
+    pub fn clamp_to_work_area(x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
+        // The title bar is the part the user must be able to grab; checking its
+        // middle also rejects a saved point that is a few pixels off-screen.
+        let saved = work_area_at(Point { x: x + width / 2, y: y + 12 });
+        let some_area = saved.or_else(cursor_work_area);
+        let Some(area) = some_area else {
+            return (x.max(0), y.max(0));
+        };
+        (
+            x.clamp(area.left, (area.right - width).max(area.left)),
+            y.clamp(area.top, (area.bottom - height).max(area.top)),
+        )
+    }
+
+    /// First position: top-right of the monitor under the cursor, clear of the
+    /// taskbar and of the screen edge.
+    pub fn default_mini_position(width: i32, height: i32) -> (i32, i32) {
+        let Some(area) = cursor_work_area() else {
+            return (100, 100);
+        };
+        (
+            (area.right - width - super::MINI_MARGIN)
+                .clamp(area.left, (area.right - width).max(area.left)),
+            (area.top + super::MINI_MARGIN)
+                .clamp(area.top, (area.bottom - height).max(area.top)),
+        )
     }
 
     /// A window erases itself with white until a webview paints over it. The
@@ -423,6 +743,28 @@ mod native {
         }
         unsafe {
             SetClassLongPtrW(hwnd as *mut c_void, GCLP_HBRBACKGROUND, brush as isize);
+        }
+    }
+
+    /// A dark title bar, so the mini window does not look like a white strip
+    /// pasted onto the dark interface. Windows 10 1809+ and Windows 11 accept
+    /// 20; the earlier attribute number was 19.
+    pub fn dark_title(hwnd: isize) {
+        const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+        const DWMWA_USE_IMMERSIVE_DARK_MODE_OLD: u32 = 19;
+        let on: i32 = 1;
+        unsafe {
+            let attr = &on as *const i32 as *const c_void;
+            let size = std::mem::size_of::<i32>() as u32;
+            let code = DwmSetWindowAttribute(hwnd as *mut c_void, DWMWA_USE_IMMERSIVE_DARK_MODE, attr, size);
+            if code != 0 {
+                DwmSetWindowAttribute(
+                    hwnd as *mut c_void,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE_OLD,
+                    attr,
+                    size,
+                );
+            }
         }
     }
 

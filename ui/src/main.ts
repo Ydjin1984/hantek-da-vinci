@@ -384,6 +384,7 @@ function buildShell(): void {
       <span id="pill-rec" class="pill">REC выкл</span>
       <button id="run" class="live" type="button">Стоп</button>
       <button id="hold" type="button" aria-pressed="false">Удержать экран</button>
+      <button id="mini" type="button" title="Отдельное окно поверх остальных: три канала">Мини-режим</button>
       <button id="peaks" type="button">Сброс пиков</button>
       <button id="rec" type="button" aria-pressed="false">Запись</button>
       <button id="csv-frame" type="button">CSV кадра</button>
@@ -477,6 +478,7 @@ function buildShell(): void {
   $("run").addEventListener("click", () => void toggleRun());
   $("reconnect").addEventListener("click", () => void reconnectLink());
   $("hold").addEventListener("click", () => void toggleHold());
+  $("mini").addEventListener("click", openMini);
   $("peaks").addEventListener("click", () => void resetPeaks());
   $("rec").addEventListener("click", () => void toggleRec());
   $("csv-frame").addEventListener("click", () => downloadFrameCsv());
@@ -680,6 +682,110 @@ async function reconnectLink(): Promise<void> {
     await poll();
   } catch (e) {
     fail(e);
+  }
+}
+
+// ---------------------------------------------------------------- mini mode
+
+type IpcWindow = Window & { ipc?: { postMessage(message: string): void } };
+
+/** The Document Picture-in-Picture window, when the browser fallback is used. */
+let pipWindow: Window | null = null;
+
+/**
+ * "Мини-режим" is a second *native* window in the installed program: the page
+ * cannot make an always-on-top window itself, so it asks the Rust side over
+ * wry's IPC bridge. The Rust side minimises this window, opens the small one and
+ * brings this one back when the small one closes — the capture engine, the
+ * instrument handle and the recording never leave their thread.
+ *
+ * In `--browser` mode there is no Rust side. Document Picture-in-Picture is the
+ * one web mechanism that produces an always-on-top system window; a named popup
+ * is the last resort for browsers without it.
+ */
+function openMini(): void {
+  const ipc = (window as IpcWindow).ipc;
+  if (ipc) {
+    ipc.postMessage("mini-open");
+    return;
+  }
+  void openMiniInBrowser();
+}
+
+async function openMiniInBrowser(): Promise<void> {
+  const dpip = (
+    window as unknown as {
+      documentPictureInPicture?: {
+        requestWindow(options?: { width?: number; height?: number }): Promise<Window>;
+      };
+    }
+  ).documentPictureInPicture;
+
+  if (dpip?.requestWindow) {
+    let opened: Window | null = null;
+    try {
+      if (pipWindow && !pipWindow.closed) {
+        pipWindow.focus();
+        return;
+      }
+      const pip = await dpip.requestWindow({ width: 360, height: 280 });
+      opened = pip;
+      pipWindow = pip;
+      pip.document.body.style.cssText = "margin:0;background:#080b10;overflow:hidden";
+      const frame = pip.document.createElement("iframe");
+      // Same origin, same server, same read-only endpoints as this page.
+      frame.src = "mini.html?pip=1";
+      frame.style.cssText = "display:block;width:100%;height:100%;border:0;background:#080b10";
+      pip.document.body.append(frame);
+      pip.addEventListener("message", (event: MessageEvent) => {
+        if (event.data === "davinci-mini-close" && event.source === frame.contentWindow) {
+          pip.close();
+        }
+      });
+      pip.addEventListener("pagehide", () => {
+        if (pipWindow === pip) pipWindow = null;
+      });
+      return;
+    } catch {
+      // Denied or unsupported at run time: a plain window is still better than
+      // silently doing nothing. A PiP window that was already opened must not
+      // stay behind as an empty shell.
+      if (opened) {
+        try {
+          opened.close();
+        } catch {
+          /* already gone */
+        }
+      }
+      pipWindow = null;
+    }
+  }
+
+  const saved = readMiniPosition();
+  const features = [
+    "popup=yes",
+    "width=360",
+    "height=280",
+    saved ? `left=${saved.x}` : "",
+    saved ? `top=${saved.y}` : "",
+  ]
+    .filter(Boolean)
+    .join(",");
+  const win = window.open("mini.html", "davinci-mini", features);
+  if (!win) fail("браузер заблокировал отдельное окно мини-режима");
+  else win.focus();
+}
+
+/** Position left by the mini page (browser fallback; Rust has its own file). */
+function readMiniPosition(): { x: number; y: number } | null {
+  try {
+    const raw = localStorage.getItem("davinci.mini.position");
+    if (!raw) return null;
+    const p = JSON.parse(raw) as { x?: unknown; y?: unknown };
+    if (typeof p.x !== "number" || typeof p.y !== "number") return null;
+    return { x: Math.round(p.x), y: Math.round(p.y) };
+  } catch {
+    return null;
   }
 }
 

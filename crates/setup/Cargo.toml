@@ -1,6 +1,6 @@
 [package]
 name = "davinci-setup"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "MIT"
 description = "Установщик «Осциллограф Хелтег да Винчи»"
